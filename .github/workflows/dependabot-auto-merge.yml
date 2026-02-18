@@ -41,17 +41,20 @@ jobs:
             const previousVersion = '${{ steps.metadata.outputs.previous-version }}';
             const newVersion = '${{ steps.metadata.outputs.new-version }}';
             
+            // Extract semantic version type for user-friendly display
+            const semverType = updateType.replace('version-update:semver-', '');
+            
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
               body: `⚠️ **Manual Review Required**
               
-              This is a **${updateType}** update, not a patch.
+              This is a **${semverType}** update, not a patch.
               
               Please review the changelog and test before merging:
               - **Package:** ${dependencyNames}
-              - **Update Type:** ${updateType}
+              - **Update Type:** ${semverType}
               - **Previous Version:** ${previousVersion}
               - **New Version:** ${newVersion}
               
