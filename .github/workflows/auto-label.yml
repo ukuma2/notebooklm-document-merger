@@ -1,0 +1,122 @@
+name: Auto Label PRs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label-pr:
+    name: Auto Label Pull Request
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Get changed files
+        id: changed_files
+        uses: tj-actions/changed-files@v42
+        with:
+          files: |
+            **/*.py
+            **/*.md
+            **/requirements*.txt
+            **/*.yml
+            **/*.yaml
+            
+      - name: Label based on file types
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const changedFiles = `${{ steps.changed_files.outputs.all_changed_files }}`.split(' ');
+            const labels = [];
+            
+            // Check file types
+            const hasPython = changedFiles.some(f => f.endsWith('.py'));
+            const hasMarkdown = changedFiles.some(f => f.endsWith('.md'));
+            const hasDependencies = changedFiles.some(f => f.includes('requirements') && f.endsWith('.txt'));
+            const hasWorkflows = changedFiles.some(f => f.includes('.github/workflows'));
+            
+            if (hasPython) labels.push('python');
+            if (hasMarkdown) labels.push('documentation');
+            if (hasDependencies) labels.push('dependencies');
+            if (hasWorkflows) labels.push('github-actions');
+            
+            // Label based on PR size
+            const additions = context.payload.pull_request.additions;
+            const deletions = context.payload.pull_request.deletions;
+            const totalChanges = additions + deletions;
+            
+            if (totalChanges < 50) {
+              labels.push('size/small');
+            } else if (totalChanges < 200) {
+              labels.push('size/medium');
+            } else {
+              labels.push('size/large');
+            }
+            
+            // Label if from fork
+            const isFork = context.payload.pull_request.head.repo.fork;
+            if (isFork) {
+              labels.push('external-contribution');
+            }
+            
+            // Create labels if they don't exist and apply them
+            for (const label of labels) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  labels: [label]
+                });
+              } catch (error) {
+                console.log(`Label ${label} might not exist, creating it...`);
+                // Try to create the label if it doesn't exist
+                try {
+                  let color = '0366d6'; // default blue
+                  if (label === 'python') color = '3572a5';
+                  if (label === 'documentation') color = '0075ca';
+                  if (label === 'dependencies') color = 'd73a4a';
+                  if (label === 'github-actions') color = '2cbe4e';
+                  if (label.startsWith('size/')) color = 'fbca04';
+                  if (label === 'external-contribution') color = '7057ff';
+                  
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: label,
+                    color: color,
+                    description: `Auto-generated label for ${label}`
+                  });
+                  
+                  // Try adding again
+                  await github.rest.issues.addLabels({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    labels: [label]
+                  });
+                } catch (createError) {
+                  console.log(`Could not create or add label ${label}: ${createError.message}`);
+                }
+              }
+            }
+            
+            // Comment on PR with applied labels
+            const labelList = labels.map(l => `\`${l}\``).join(', ');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `🏷️ **Auto-labeled this PR:** ${labelList}\n\nLabels are automatically applied based on the files changed and PR characteristics.`
+            });

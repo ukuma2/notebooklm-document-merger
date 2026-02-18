@@ -1,0 +1,53 @@
+version: 2
+updates:
+  # Python dependencies
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+      - "auto-merge"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    reviewers:
+      - "ukuma2"
+    assignees:
+      - "ukuma2"
+    # Group all minor and patch updates together
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    # Ignore specific packages if needed
+    # ignore:
+    #   - dependency-name: "package-name"
+    #     versions: ["x.x.x"]
+    
+  # GitHub Actions dependencies
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+      - "auto-merge"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    reviewers:
+      - "ukuma2"
+    assignees:
+      - "ukuma2"
