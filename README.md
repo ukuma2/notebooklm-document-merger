@@ -157,6 +157,12 @@ To create a `.exe` file that doesn't require Python:
 - Ensure Python 3.8+ is installed: `python --version`
 - Install dependencies: `pip install -r requirements.txt`
 
+**Q: "No module named 'tkinter'" error**
+- **Ubuntu/Debian**: `sudo apt-get install python3-tk`
+- **Fedora**: `sudo dnf install python3-tkinter`
+- **macOS**: Tkinter should be included with Python. Reinstall Python from python.org if missing
+- **Windows**: Tkinter is included by default. Reinstall Python and ensure "tcl/tk and IDLE" is checked
+
 **Q: "Module not found" error**
 - Run: `pip install -r requirements.txt`
 
@@ -167,6 +173,11 @@ To create a `.exe` file that doesn't require Python:
 **Q: DOCX formatting issues**
 - Complex formatting may not transfer perfectly
 - Basic styles, tables, and images are preserved
+
+**Q: Emoji characters not displaying properly**
+- The GUI uses Unicode emojis (📄, 📝, 📧, 🚀) which may not render on older systems
+- On Windows 7/8 or minimal Linux systems, you may see boxes instead of emojis
+- This is a cosmetic issue and doesn't affect functionality
 
 ---
 
