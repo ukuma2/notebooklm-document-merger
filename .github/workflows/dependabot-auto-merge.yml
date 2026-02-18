@@ -36,19 +36,24 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const updateType = '${{ steps.metadata.outputs.update-type }}';
+            const dependencyNames = '${{ steps.metadata.outputs.dependency-names }}';
+            const previousVersion = '${{ steps.metadata.outputs.previous-version }}';
+            const newVersion = '${{ steps.metadata.outputs.new-version }}';
+            
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
               body: `⚠️ **Manual Review Required**
               
-              This is a **${{ steps.metadata.outputs.update-type }}** update, not a patch.
+              This is a **${updateType}** update, not a patch.
               
               Please review the changelog and test before merging:
-              - **Package:** ${{ steps.metadata.outputs.dependency-names }}
-              - **Update Type:** ${{ steps.metadata.outputs.update-type }}
-              - **Previous Version:** ${{ steps.metadata.outputs.previous-version }}
-              - **New Version:** ${{ steps.metadata.outputs.new-version }}
+              - **Package:** ${dependencyNames}
+              - **Update Type:** ${updateType}
+              - **Previous Version:** ${previousVersion}
+              - **New Version:** ${newVersion}
               
               Patch updates (x.y.Z) are auto-merged, but minor (x.Y.z) and major (X.y.z) require manual approval.`
             });
