@@ -226,10 +226,28 @@ PRs can be automatically merged when ALL of these conditions are met:
 - Auto-merge requires approval from a maintainer
 - Your code is automatically checked without requiring manual intervention
 
+#### 🔒 Security Features
+
+**For Fork Contributors:**
+- All workflows run safely without access to repository secrets
+- Code is checked out in read-only mode
+- Auto-merge requires maintainer approval for all external PRs
+
+**Dependabot Auto-Merge Policy:**
+- ✅ **Patch updates** (1.2.3 → 1.2.4): Auto-merged after checks pass
+- ⚠️ **Minor updates** (1.2.0 → 1.3.0): Requires manual review
+- 🚨 **Major updates** (1.0.0 → 2.0.0): Requires manual review
+
+**Security Scanning:**
+- CodeQL analysis runs on all PRs and weekly
+- Dependency review checks for known vulnerabilities
+- Moderate+ severity issues block PRs
+
 #### Dependabot Updates
 - Automatically checks for Python dependency updates weekly (Mondays at 9 AM)
 - Creates PRs for security updates and version bumps
-- Dependency update PRs are pre-labeled with `auto-merge` for quick integration
+- Patch updates are auto-merged after passing checks
+- Minor and major updates require manual review
 
 #### Branch Protection Recommendations
 For repository maintainers, recommended branch protection rules for `main`:
