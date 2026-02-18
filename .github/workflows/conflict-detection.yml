@@ -1,0 +1,159 @@
+name: PR Conflict Detection
+
+on:
+  pull_request:
+    branches: [ main, master ]
+    types: [opened, synchronize, reopened]
+  pull_request_target:
+    branches: [ main, master ]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  check-conflicts:
+    name: Check for Merge Conflicts
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+          
+      - name: Fetch PR branch
+        run: |
+          git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-branch
+          
+      - name: Check for conflicts
+        id: check_conflicts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Try to merge PR branch into base
+          if git merge --no-commit --no-ff pr-branch; then
+            echo "has_conflicts=false" >> $GITHUB_OUTPUT
+            git merge --abort
+          else
+            echo "has_conflicts=true" >> $GITHUB_OUTPUT
+            git merge --abort || true
+          fi
+          
+      - name: Update check status
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const hasConflicts = '${{ steps.check_conflicts.outputs.has_conflicts }}' === 'true';
+            const prNumber = context.payload.pull_request.number;
+            
+            if (hasConflicts) {
+              await github.rest.checks.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'Merge Conflicts',
+                head_sha: context.payload.pull_request.head.sha,
+                status: 'completed',
+                conclusion: 'failure',
+                output: {
+                  title: 'Merge conflicts detected',
+                  summary: 'This PR has merge conflicts with the base branch. Please resolve them.'
+                }
+              });
+            } else {
+              await github.rest.checks.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'Merge Conflicts',
+                head_sha: context.payload.pull_request.head.sha,
+                status: 'completed',
+                conclusion: 'success',
+                output: {
+                  title: 'No merge conflicts',
+                  summary: 'This PR has no merge conflicts with the base branch.'
+                }
+              });
+            }
+            
+      - name: Comment on PR if conflicts detected
+        if: steps.check_conflicts.outputs.has_conflicts == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            
+            // Check if we already commented
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const botComment = comments.data.find(comment => 
+              comment.user.login === 'github-actions[bot]' && 
+              comment.body.includes('⚠️ Merge Conflicts Detected')
+            );
+            
+            const message = `⚠️ **Merge Conflicts Detected**
+            
+            This pull request has merge conflicts with the base branch (\`${context.payload.pull_request.base.ref}\`).
+            
+            **To resolve:**
+            1. Sync your branch with the base branch:
+               \`\`\`bash
+               git fetch origin
+               git merge origin/${context.payload.pull_request.base.ref}
+               \`\`\`
+            2. Resolve the conflicts in your editor
+            3. Commit the changes:
+               \`\`\`bash
+               git add .
+               git commit -m "Resolve merge conflicts"
+               git push
+               \`\`\`
+            
+            The conflict check will automatically re-run when you push updates.`;
+            
+            if (!botComment) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: message
+              });
+            }
+            
+      - name: Comment on PR when conflicts resolved
+        if: steps.check_conflicts.outputs.has_conflicts == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            
+            // Check if we previously commented about conflicts
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const conflictComment = comments.data.find(comment => 
+              comment.user.login === 'github-actions[bot]' && 
+              comment.body.includes('⚠️ Merge Conflicts Detected')
+            );
+            
+            if (conflictComment) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: '✅ **Merge conflicts have been resolved!** This PR can now be merged.'
+              });
+            }

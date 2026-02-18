@@ -1,0 +1,212 @@
+name: Auto Merge
+
+on:
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  auto-merge:
+    name: Auto Merge PR
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Get PR details
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            let pr;
+            
+            if (context.eventName === 'pull_request' || context.eventName === 'pull_request_review') {
+              pr = context.payload.pull_request;
+            } else if (context.eventName === 'check_suite') {
+              const pulls = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                head: `${context.repo.owner}:${context.payload.check_suite.head_branch}`
+              });
+              
+              if (pulls.data.length === 0) {
+                console.log('No open PR found for this check suite');
+                return;
+              }
+              pr = pulls.data[0];
+            }
+            
+            if (!pr) {
+              console.log('No PR found');
+              return;
+            }
+            
+            core.setOutput('number', pr.number);
+            core.setOutput('mergeable', pr.mergeable);
+            core.setOutput('sha', pr.head.sha);
+            return pr.number;
+            
+      - name: Check if auto-merge is enabled
+        if: steps.pr.outputs.number
+        id: check_auto_merge
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = ${{ steps.pr.outputs.number }};
+            
+            // Get PR labels
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const hasAutoMergeLabel = labels.some(label => label.name === 'auto-merge');
+            
+            // Get reviews
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            
+            const approvedReviews = reviews.filter(review => review.state === 'APPROVED');
+            const hasApproval = approvedReviews.length > 0;
+            
+            core.setOutput('enabled', hasAutoMergeLabel || hasApproval);
+            core.setOutput('has_approval', hasApproval);
+            core.setOutput('has_label', hasAutoMergeLabel);
+            
+      - name: Check all required checks
+        if: steps.check_auto_merge.outputs.enabled == 'true'
+        id: check_status
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = ${{ steps.pr.outputs.number }};
+            const sha = '${{ steps.pr.outputs.sha }}';
+            
+            // Get check runs for this SHA
+            const { data: checkRuns } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: sha
+            });
+            
+            // Get commit status
+            const { data: statuses } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: sha
+            });
+            
+            // Check if all checks passed
+            const allChecksPassed = checkRuns.check_runs.every(check => 
+              check.conclusion === 'success' || check.conclusion === 'skipped' || check.conclusion === 'neutral'
+            );
+            
+            const allStatusesPassed = statuses.state === 'success' || statuses.statuses.length === 0;
+            
+            core.setOutput('all_passed', allChecksPassed && allStatusesPassed);
+            
+      - name: Check for conflicts
+        if: steps.check_auto_merge.outputs.enabled == 'true'
+        id: check_conflicts
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = ${{ steps.pr.outputs.number }};
+            
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            
+            core.setOutput('mergeable', pr.mergeable !== false);
+            
+      - name: Attempt auto-merge
+        if: |
+          steps.check_auto_merge.outputs.enabled == 'true' &&
+          steps.check_status.outputs.all_passed == 'true' &&
+          steps.check_conflicts.outputs.mergeable == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = ${{ steps.pr.outputs.number }};
+            
+            try {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                merge_method: 'squash',
+                commit_title: `Auto-merge PR #${prNumber}`
+              });
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `✅ **Auto-merged successfully!**
+                
+                This PR was automatically merged because:
+                - ✅ All required checks passed
+                - ✅ No merge conflicts
+                - ✅ ${context.payload.review ? 'Approved by reviewer' : 'Has auto-merge label'}
+                - ✅ Branch is up to date`
+              });
+            } catch (error) {
+              console.log(`Auto-merge failed: ${error.message}`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `❌ **Auto-merge failed**
+                
+                Reason: ${error.message}
+                
+                Please merge manually.`
+              });
+            }
+            
+      - name: Comment why auto-merge didn't happen
+        if: |
+          steps.check_auto_merge.outputs.enabled == 'true' &&
+          (steps.check_status.outputs.all_passed != 'true' || steps.check_conflicts.outputs.mergeable != 'true')
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = ${{ steps.pr.outputs.number }};
+            const allPassed = '${{ steps.check_status.outputs.all_passed }}' === 'true';
+            const mergeable = '${{ steps.check_conflicts.outputs.mergeable }}' === 'true';
+            
+            const reasons = [];
+            if (!allPassed) reasons.push('❌ Not all required checks passed');
+            if (!mergeable) reasons.push('❌ Has merge conflicts');
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `⏸️ **Auto-merge not performed**
+              
+              This PR has auto-merge enabled, but cannot be merged yet:
+              
+              ${reasons.join('\n')}
+              
+              Once these issues are resolved, auto-merge will proceed automatically.`
+            });

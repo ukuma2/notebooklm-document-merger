@@ -197,6 +197,48 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [ ] Batch rename utility
 - [ ] Undo/rollback functionality
 
+### 🤖 Automated Workflows
+
+This repository uses GitHub Actions to automate pull request validation and merging. Here's what happens automatically:
+
+#### PR Validation
+When you submit a pull request:
+- **✅ Automated Testing & Linting**: Code is automatically checked with flake8 and pylint
+- **🔍 Conflict Detection**: Checks for merge conflicts with the base branch
+- **🏷️ Auto-Labeling**: PRs are automatically labeled based on:
+  - File types changed (python, documentation, dependencies, github-actions)
+  - PR size (small <50 lines, medium <200 lines, large 200+ lines)
+  - Source (external-contribution for forks)
+
+#### Auto-Merge System
+PRs can be automatically merged when ALL of these conditions are met:
+- ✅ All required checks pass (linting, tests)
+- ✅ No merge conflicts with base branch
+- ✅ Approved by at least one reviewer **OR** has the `auto-merge` label
+- ✅ Branch is up to date
+
+**To enable auto-merge on your PR:**
+1. Wait for a project maintainer to review and approve your PR, OR
+2. If you're a trusted contributor, add the `auto-merge` label
+
+**For Fork Contributors:**
+- All workflows run safely on PRs from forks
+- Auto-merge requires approval from a maintainer
+- Your code is automatically checked without requiring manual intervention
+
+#### Dependabot Updates
+- Automatically checks for Python dependency updates weekly (Mondays at 9 AM)
+- Creates PRs for security updates and version bumps
+- Dependency update PRs are pre-labeled with `auto-merge` for quick integration
+
+#### Branch Protection Recommendations
+For repository maintainers, recommended branch protection rules for `main`:
+- Require pull request reviews (at least 1 approval)
+- Require status checks to pass before merging
+- Required checks: "Lint and Test", "Check for Merge Conflicts"
+- Require branches to be up to date before merging
+- Include administrators in restrictions
+
 ---
 
 ## 📝 License
