@@ -1,0 +1,46 @@
+# Exclude data and test files
+Hydrera/
+merged_output*/
+*.pdf
+*.docx
+*.doc
+*.msg
+*.eml
+*.xml
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.exe
+*.app
+
+# Logs
+*.log
+
+# Test outputs
+test_*.py
