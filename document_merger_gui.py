@@ -244,8 +244,8 @@ class DocumentMergerGUI:
                     subprocess.run(['open', folder_path])
                 else:  # Linux and other Unix-like systems
                     subprocess.run(['xdg-open', folder_path])
-            except Exception as e:
-                messagebox.showwarning("Cannot Open Folder", 
+            except Exception:
+                messagebox.showwarning("Cannot Open Folder",
                                       f"Output saved to:\n{folder_path}\n\n"
                                       f"Please open manually.")
     
@@ -262,7 +262,7 @@ class DocumentMergerGUI:
 def main():
     """Main entry point"""
     root = tk.Tk()
-    app = DocumentMergerGUI(root)
+    DocumentMergerGUI(root)
     root.mainloop()
 
 
