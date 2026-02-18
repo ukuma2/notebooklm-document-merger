@@ -21,7 +21,7 @@ jobs:
     steps:
       - name: Get PR details
         id: pr
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -57,7 +57,7 @@ jobs:
       - name: Check if auto-merge is enabled
         if: steps.pr.outputs.number
         id: check_auto_merge
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -89,7 +89,7 @@ jobs:
       - name: Check all required checks
         if: steps.check_auto_merge.outputs.enabled == 'true'
         id: check_status
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -122,7 +122,7 @@ jobs:
       - name: Check for conflicts
         if: steps.check_auto_merge.outputs.enabled == 'true'
         id: check_conflicts
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -141,7 +141,7 @@ jobs:
           steps.check_auto_merge.outputs.enabled == 'true' &&
           steps.check_status.outputs.all_passed == 'true' &&
           steps.check_conflicts.outputs.mergeable == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -186,7 +186,7 @@ jobs:
         if: |
           steps.check_auto_merge.outputs.enabled == 'true' &&
           (steps.check_status.outputs.all_passed != 'true' || steps.check_conflicts.outputs.mergeable != 'true')
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
