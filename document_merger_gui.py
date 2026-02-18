@@ -7,6 +7,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
 import os
+import platform
+import subprocess
 from pathlib import Path
 from merger_engine import MergeOrchestrator
 
@@ -192,7 +194,10 @@ class DocumentMergerGUI:
             # Create merger
             orchestrator = MergeOrchestrator(
                 max_file_size_kb=self.max_file_size.get(),
-                max_output_files=self.max_output_files.get()
+                max_output_files=self.max_output_files.get(),
+                process_pdfs=self.process_pdfs.get(),
+                process_docx=self.process_docx.get(),
+                process_emails=self.process_emails.get()
             )
             
             # Run merge
@@ -231,7 +236,18 @@ class DocumentMergerGUI:
         
         # Ask if user wants to open output folder
         if messagebox.askyesno("Open Folder", "Would you like to open the output folder?"):
-            os.startfile(self.output_folder.get())
+            folder_path = self.output_folder.get()
+            try:
+                if platform.system() == 'Windows':
+                    os.startfile(folder_path)
+                elif platform.system() == 'Darwin':  # macOS
+                    subprocess.run(['open', folder_path], check=True)
+                else:  # Linux and other Unix-like systems
+                    subprocess.run(['xdg-open', folder_path], check=True)
+            except (OSError, FileNotFoundError, subprocess.CalledProcessError):
+                messagebox.showwarning("Cannot Open Folder",
+                                      f"Output saved to:\n{folder_path}\n\n"
+                                      f"Please open manually.")
     
     def on_merge_error(self, error_msg):
         """Called when merge encounters an error"""
@@ -246,7 +262,7 @@ class DocumentMergerGUI:
 def main():
     """Main entry point"""
     root = tk.Tk()
-    app = DocumentMergerGUI(root)
+    DocumentMergerGUI(root)
     root.mainloop()
 
 

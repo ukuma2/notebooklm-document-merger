@@ -548,13 +548,17 @@ class FolderAnalyzer:
 class MergeOrchestrator:
     """Coordinates the entire merging process"""
     
-    def __init__(self, max_file_size_kb=800, max_output_files=300):
+    def __init__(self, max_file_size_kb=800, max_output_files=300, 
+                 process_pdfs=True, process_docx=True, process_emails=True):
         self.pdf_merger = PDFMerger(max_file_size_kb)
         self.docx_merger = DOCXMerger(max_file_size_kb)
         self.email_extractor = EmailExtractor()
         self.email_threader = EmailThreader()
         self.folder_analyzer = FolderAnalyzer()
         self.max_output_files = max_output_files
+        self.process_pdfs = process_pdfs
+        self.process_docx = process_docx
+        self.process_emails = process_emails
         
     def merge_documents(self, input_path: str, output_path: str, progress_callback=None) -> Dict:
         """
@@ -587,19 +591,19 @@ class MergeOrchestrator:
             emails = [f for f in files if f.lower().endswith(('.msg', '.eml'))]
             
             # Merge PDFs
-            if pdfs:
+            if pdfs and self.process_pdfs:
                 print(f"  Merging {len(pdfs)} PDF files...")
                 pdf_outputs = self.pdf_merger.merge_pdfs(pdfs, output_path, group_name)
                 output_files.extend(pdf_outputs)
             
             # Merge DOCX
-            if docx:
+            if docx and self.process_docx:
                 print(f"  Merging {len(docx)} document files...")
                 docx_outputs = self.docx_merger.merge_docx(docx, output_path, group_name)
                 output_files.extend(docx_outputs)
             
             # Merge emails
-            if emails:
+            if emails and self.process_emails:
                 print(f"  Processing {len(emails)} email files...")
                 email_outputs = self._process_emails(emails, output_path, group_name)
                 output_files.extend(email_outputs)
