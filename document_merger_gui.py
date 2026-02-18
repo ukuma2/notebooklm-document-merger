@@ -241,10 +241,10 @@ class DocumentMergerGUI:
                 if platform.system() == 'Windows':
                     os.startfile(folder_path)
                 elif platform.system() == 'Darwin':  # macOS
-                    subprocess.run(['open', folder_path])
+                    subprocess.run(['open', folder_path], check=True)
                 else:  # Linux and other Unix-like systems
-                    subprocess.run(['xdg-open', folder_path])
-            except Exception:
+                    subprocess.run(['xdg-open', folder_path], check=True)
+            except (OSError, FileNotFoundError, subprocess.CalledProcessError):
                 messagebox.showwarning("Cannot Open Folder",
                                       f"Output saved to:\n{folder_path}\n\n"
                                       f"Please open manually.")
