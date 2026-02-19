@@ -270,6 +270,16 @@ For repository maintainers, recommended branch protection rules for `main`:
 
 ---
 
+## Operational Known Limits
+
+- Password-protected or heavily malformed PDFs may be skipped and reported in `merge_manifest.json`.
+- Legacy Word `.doc` recovery is best-effort text extraction and may not preserve layout fidelity.
+- Very large source sets can exceed `Max Output Files`; the run stops with a clear limit error before writing excess files.
+- If output is placed inside input, the output folder is automatically excluded from scanning to prevent re-processing generated files.
+- Email threading is subject-based and date-sorted; missing or invalid dates are treated as oldest items in a thread.
+
+---
+
 ## 📝 License
 
 This project is licensed under the MIT License - see below for details.

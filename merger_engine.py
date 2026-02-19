@@ -5,9 +5,9 @@ Handles PDF, DOCX, and Email merging with flexible folder structure support
 
 import os
 import json
-from pathlib import Path
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from copy import deepcopy
+from datetime import datetime, timezone
+from typing import List, Dict, Optional
 from collections import defaultdict
 import re
 
@@ -47,6 +47,15 @@ from email.parser import BytesParser
 from dateutil import parser as date_parser
 
 
+def _record_warning(warnings: Optional[List[Dict]], code: str, message: str, **context) -> None:
+    """Append a structured warning when a warning collector is provided."""
+    if warnings is None:
+        return
+    warning = {'code': code, 'message': message}
+    warning.update(context)
+    warnings.append(warning)
+
+
 class PDFMerger:
     """Merges multiple PDF files into batched output files"""
     
@@ -54,7 +63,37 @@ class PDFMerger:
         self.max_file_size_kb = max_file_size_kb
         self.max_file_size_bytes = max_file_size_kb * 1024
         
-    def merge_pdfs(self, pdf_files: List[str], output_path: str, group_name: str) -> List[str]:
+    def estimate_batch_count(self, pdf_files: List[str]) -> int:
+        """Estimate how many output batches a merge operation will create."""
+        pdf_files = sorted(pdf_files)
+        if not pdf_files:
+            return 0
+
+        batches = 1
+        current_batch_size = 0
+
+        for pdf_file in pdf_files:
+            try:
+                file_size = os.path.getsize(pdf_file)
+            except OSError:
+                # Avoid underestimating in preflight checks.
+                file_size = self.max_file_size_bytes
+
+            if current_batch_size and (current_batch_size + file_size > self.max_file_size_bytes):
+                batches += 1
+                current_batch_size = 0
+
+            current_batch_size += file_size
+
+        return batches
+
+    def merge_pdfs(
+        self,
+        pdf_files: List[str],
+        output_path: str,
+        group_name: str,
+        warnings: Optional[List[Dict]] = None,
+    ) -> List[str]:
         """
         Merge PDF files into batches, staying under size limit
         
@@ -80,12 +119,25 @@ class PDFMerger:
         batch_num = 1
         
         for pdf_file in pdf_files:
-            file_size = os.path.getsize(pdf_file)
+            try:
+                file_size = os.path.getsize(pdf_file)
+            except OSError as exc:
+                _record_warning(
+                    warnings,
+                    'pdf_stat_failed',
+                    'Could not determine PDF file size; using max batch size for pre-allocation',
+                    file=pdf_file,
+                    error=str(exc),
+                )
+                file_size = self.max_file_size_bytes
             
             # If adding this file would exceed limit, save current batch
             if current_batch and (current_batch_size + file_size > self.max_file_size_bytes):
-                output_file = self._save_pdf_batch(current_batch, output_path, group_name, batch_num)
-                output_files.append(output_file)
+                output_file = self._save_pdf_batch(
+                    current_batch, output_path, group_name, batch_num, warnings
+                )
+                if output_file:
+                    output_files.append(output_file)
                 batch_num += 1
                 current_batch = []
                 current_batch_size = 0
@@ -95,8 +147,11 @@ class PDFMerger:
         
         # Save remaining files
         if current_batch:
-            output_file = self._save_pdf_batch(current_batch, output_path, group_name, batch_num)
-            output_files.append(output_file)
+            output_file = self._save_pdf_batch(
+                current_batch, output_path, group_name, batch_num, warnings
+            )
+            if output_file:
+                output_files.append(output_file)
         
         return output_files
     
@@ -204,16 +259,34 @@ class PDFMerger:
             return None
 
 
-    def _save_pdf_batch(self, pdf_files: List[str], output_path: str, group_name: str, batch_num: int) -> str:
+    def _save_pdf_batch(
+        self,
+        pdf_files: List[str],
+        output_path: str,
+        group_name: str,
+        batch_num: int,
+        warnings: Optional[List[Dict]] = None,
+    ) -> Optional[str]:
         """Save a batch of PDFs into a single merged PDF"""
         writer = PdfWriter()
+        total_pages_added = 0
         
         # Add all pages from all PDFs
         for pdf_file in pdf_files:
             try:
                 reader = PdfReader(pdf_file)
+                file_pages_added = 0
                 for page in reader.pages:
                     writer.add_page(page)
+                    file_pages_added += 1
+                if file_pages_added == 0:
+                    _record_warning(
+                        warnings,
+                        'pdf_no_pages',
+                        'PDF contained zero readable pages',
+                        file=pdf_file,
+                    )
+                total_pages_added += file_pages_added
             except Exception as e:
                 # Fallback 1: File may be an image with a .pdf extension
                 pdf_bytes = self._try_convert_image_to_pdf(pdf_file)
@@ -223,12 +296,48 @@ class PDFMerger:
                 if pdf_bytes:
                     try:
                         reader = PdfReader(io.BytesIO(pdf_bytes))
+                        converted_pages = 0
                         for page in reader.pages:
                             writer.add_page(page)
+                            converted_pages += 1
+                        total_pages_added += converted_pages
+                        if converted_pages == 0:
+                            _record_warning(
+                                warnings,
+                                'pdf_conversion_empty',
+                                'Fallback conversion produced zero pages',
+                                file=pdf_file,
+                            )
                     except Exception as e2:
+                        _record_warning(
+                            warnings,
+                            'pdf_conversion_failed',
+                            'Could not merge file after fallback conversion',
+                            file=pdf_file,
+                            error=str(e2),
+                        )
                         print(f"Warning: Could not merge {pdf_file} even after conversion: {e2}")
                 else:
+                    _record_warning(
+                        warnings,
+                        'pdf_unreadable',
+                        'Could not read PDF file and fallback conversion failed',
+                        file=pdf_file,
+                        error=str(e),
+                    )
                     print(f"Warning: Could not merge {pdf_file}: {e}")
+
+        if total_pages_added == 0:
+            _record_warning(
+                warnings,
+                'pdf_empty_batch',
+                'Skipped PDF batch because no readable pages were found',
+                group=group_name,
+                batch=batch_num,
+                file_count=len(pdf_files),
+            )
+            print(f"Warning: Skipping empty PDF batch {batch_num} for group {group_name}")
+            return None
         
         # Generate output filename
         output_filename = f"{group_name}_pdfs_batch{batch_num}.pdf"
@@ -238,7 +347,7 @@ class PDFMerger:
         with open(output_file, 'wb') as f:
             writer.write(f)
         
-        print(f"    Created: {output_filename} ({len(pdf_files)} PDFs)")
+        print(f"    Created: {output_filename} ({len(pdf_files)} PDFs, {total_pages_added} pages)")
         return output_file
 
 
@@ -249,7 +358,36 @@ class DOCXMerger:
         self.max_file_size_kb = max_file_size_kb
         self.max_file_size_bytes = max_file_size_kb * 1024
         
-    def merge_docx(self, docx_files: List[str], output_path: str, group_name: str) -> List[str]:
+    def estimate_batch_count(self, docx_files: List[str]) -> int:
+        """Estimate how many output batches a DOCX merge operation will create."""
+        docx_files = sorted(docx_files)
+        if not docx_files:
+            return 0
+
+        batches = 1
+        current_batch_size = 0
+
+        for docx_file in docx_files:
+            try:
+                file_size = os.path.getsize(docx_file)
+            except OSError:
+                file_size = self.max_file_size_bytes
+
+            if current_batch_size and (current_batch_size + file_size > self.max_file_size_bytes):
+                batches += 1
+                current_batch_size = 0
+
+            current_batch_size += file_size
+
+        return batches
+
+    def merge_docx(
+        self,
+        docx_files: List[str],
+        output_path: str,
+        group_name: str,
+        warnings: Optional[List[Dict]] = None,
+    ) -> List[str]:
         """
         Merge DOCX files into batches, staying under size limit
         
@@ -275,12 +413,25 @@ class DOCXMerger:
         batch_num = 1
         
         for docx_file in docx_files:
-            file_size = os.path.getsize(docx_file)
+            try:
+                file_size = os.path.getsize(docx_file)
+            except OSError as exc:
+                _record_warning(
+                    warnings,
+                    'docx_stat_failed',
+                    'Could not determine document file size; using max batch size for pre-allocation',
+                    file=docx_file,
+                    error=str(exc),
+                )
+                file_size = self.max_file_size_bytes
             
             # Check if we need to start a new batch
             if current_batch and (current_batch_size + file_size > self.max_file_size_bytes):
-                output_file = self._save_docx_batch(current_batch, output_path, group_name, batch_num)
-                output_files.append(output_file)
+                output_file = self._save_docx_batch(
+                    current_batch, output_path, group_name, batch_num, warnings
+                )
+                if output_file:
+                    output_files.append(output_file)
                 batch_num += 1
                 current_batch = []
                 current_batch_size = 0
@@ -290,8 +441,11 @@ class DOCXMerger:
         
         # Save remaining files
         if current_batch:
-            output_file = self._save_docx_batch(current_batch, output_path, group_name, batch_num)
-            output_files.append(output_file)
+            output_file = self._save_docx_batch(
+                current_batch, output_path, group_name, batch_num, warnings
+            )
+            if output_file:
+                output_files.append(output_file)
         
         return output_files
     
@@ -311,7 +465,6 @@ class DOCXMerger:
                     return None
                 xml_bytes = z.read(candidates[0])
             root = ET.fromstring(xml_bytes)
-            ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
             paragraphs = []
             for para in root.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
                 texts = [t.text or '' for t in para.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t')]
@@ -355,28 +508,34 @@ class DOCXMerger:
         except Exception:
             return None
 
-    def _save_docx_batch(self, docx_files: List[str], output_path: str, group_name: str, batch_num: int) -> str:
-        """Save a batch of DOCX files into a single merged document"""
+    def _save_docx_batch(
+        self,
+        docx_files: List[str],
+        output_path: str,
+        group_name: str,
+        batch_num: int,
+        warnings: Optional[List[Dict]] = None,
+    ) -> Optional[str]:
+        """Save a batch of DOCX files into a single merged document."""
         import tempfile
         import shutil
 
         merged_doc = Document()
+        merged_docs_count = 0
 
-        for idx, docx_file in enumerate(docx_files):
-            # Add document separator header
-            if idx > 0:
-                merged_doc.add_page_break()
-            heading = merged_doc.add_heading(level=1)
-            heading.text = f"Document: {os.path.basename(docx_file)}"
-
+        for docx_file in docx_files:
             source_doc = None
+            raw_text = None
+            open_error = None
 
-            # --- Attempt 1: open normally ---
+            # Attempt 1: open normally.
             try:
                 source_doc = Document(docx_file)
             except Exception as e1:
-                # --- Attempt 2: copy to a temp .docx and retry ---
-                # Handles .doc files that are actually OOXML (wrong extension)
+                open_error = e1
+
+                # Attempt 2: copy to a temp .docx and retry.
+                # Handles .doc files that are actually OOXML with wrong extension.
                 tmp_path = None
                 try:
                     tmp_fd, tmp_path = tempfile.mkstemp(suffix='.docx')
@@ -394,38 +553,89 @@ class DOCXMerger:
                             pass
 
                 if source_doc is None:
-                    # --- Attempt 3: extract raw text from the zip's document.xml ---
+                    # Attempt 3: extract raw text from the zip's document.xml.
                     raw_text = self._try_extract_docx_text(docx_file)
-                    if not raw_text:
-                        # --- Attempt 4: extract text from OLE compound document ---
+                    if raw_text:
+                        print(f"    Recovered (raw text): {os.path.basename(docx_file)}")
+                    else:
+                        # Attempt 4: extract text from OLE compound document.
                         raw_text = self._try_extract_ole_text(docx_file)
                         if raw_text:
                             print(f"    Recovered (OLE text): {os.path.basename(docx_file)}")
-                        else:
-                            print(f"Warning: Could not merge {docx_file}: {e1}")
-                            merged_doc.add_paragraph(f"[Error reading file: {os.path.basename(docx_file)}]")
-                            continue
-                    else:
-                        print(f"    Recovered (raw text): {os.path.basename(docx_file)}")
-                    merged_doc.add_paragraph(raw_text)
+
+            if source_doc is None and not raw_text:
+                _record_warning(
+                    warnings,
+                    'docx_unreadable',
+                    'Could not read DOCX/DOC file; skipping file',
+                    file=docx_file,
+                    error=str(open_error) if open_error else 'unknown_error',
+                )
+                print(f"Warning: Could not merge {docx_file}: {open_error}")
+                continue
+
+            if raw_text:
+                if merged_docs_count > 0:
+                    merged_doc.add_page_break()
+                heading = merged_doc.add_heading(level=1)
+                heading.text = f"Document: {os.path.basename(docx_file)}"
+                merged_doc.add_paragraph(raw_text)
+                merged_docs_count += 1
+                continue
+
+            try:
+                elements = [
+                    deepcopy(element)
+                    for element in source_doc.element.body.iterchildren()
+                    if not element.tag.endswith('}sectPr')
+                ]
+                if not elements:
+                    _record_warning(
+                        warnings,
+                        'docx_empty_document',
+                        'DOCX file had no readable body elements; skipping file',
+                        file=docx_file,
+                    )
                     continue
 
-            if source_doc is not None:
-                try:
-                    for element in source_doc.element.body:
-                        merged_doc.element.body.append(element)
-                except Exception as e:
-                    print(f"Warning: Could not append content from {docx_file}: {e}")
-                    merged_doc.add_paragraph(f"[Error appending content: {os.path.basename(docx_file)}]")
-        
+                if merged_docs_count > 0:
+                    merged_doc.add_page_break()
+                heading = merged_doc.add_heading(level=1)
+                heading.text = f"Document: {os.path.basename(docx_file)}"
+
+                for element in elements:
+                    merged_doc.element.body.append(element)
+                merged_docs_count += 1
+            except Exception as e:
+                _record_warning(
+                    warnings,
+                    'docx_append_failed',
+                    'Could not append DOCX body elements; skipping file',
+                    file=docx_file,
+                    error=str(e),
+                )
+                print(f"Warning: Could not append content from {docx_file}: {e}")
+
+        if merged_docs_count == 0:
+            _record_warning(
+                warnings,
+                'docx_empty_batch',
+                'Skipped DOCX batch because no readable documents were found',
+                group=group_name,
+                batch=batch_num,
+                file_count=len(docx_files),
+            )
+            print(f"Warning: Skipping empty DOCX batch {batch_num} for group {group_name}")
+            return None
+
         # Generate output filename
         output_filename = f"{group_name}_documents_batch{batch_num}.docx"
         output_file = os.path.join(output_path, output_filename)
-        
+
         # Save merged document
         merged_doc.save(output_file)
-        
-        print(f"    Created: {output_filename} ({len(docx_files)} documents)")
+
+        print(f"    Created: {output_filename} ({merged_docs_count} documents)")
         return output_file
 
 
@@ -485,6 +695,23 @@ class EmailThreader:
         subject = re.sub(r'^(RE|FW|FWD):\s*', '', subject, flags=re.IGNORECASE)
         subject = re.sub(r'\s+', ' ', subject).strip()
         return subject.lower()
+
+    @staticmethod
+    def normalize_date(date_value) -> datetime:
+        """Normalize date values to naive UTC datetimes for safe sorting."""
+        if isinstance(date_value, datetime):
+            parsed = date_value
+        elif isinstance(date_value, str) and date_value.strip():
+            try:
+                parsed = date_parser.parse(date_value)
+            except (ValueError, TypeError, OverflowError):
+                return datetime.min
+        else:
+            return datetime.min
+
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
     
     def group_emails(self, email_data: List[Dict]) -> Dict[str, List[Dict]]:
         """
@@ -505,7 +732,7 @@ class EmailThreader:
         
         # Sort emails within each thread by date
         for thread_emails in threads.values():
-            thread_emails.sort(key=lambda e: e.get('date') or datetime.min)
+            thread_emails.sort(key=lambda e: self.normalize_date(e.get('date')))
         
         return dict(threads)
 
@@ -514,19 +741,45 @@ class FolderAnalyzer:
     """Analyzes folder structure and determines grouping strategy"""
     
     @staticmethod
-    def analyze_structure(root_path: str) -> Dict[str, List[str]]:
+    def analyze_structure(
+        root_path: str,
+        exclude_paths: Optional[List[str]] = None,
+    ) -> Dict[str, List[str]]:
         """
         Analyze folder structure and group files by parent folder
         
         Args:
             root_path: Root directory to analyze
+            exclude_paths: Optional list of directories to exclude from traversal
             
         Returns:
             Dict mapping group_name to list of file paths
         """
         groups = defaultdict(list)
-        
+        excluded = [
+            os.path.normcase(os.path.abspath(path))
+            for path in (exclude_paths or [])
+            if path
+        ]
+
+        def is_excluded(candidate_path: str) -> bool:
+            candidate = os.path.normcase(os.path.abspath(candidate_path))
+            for excluded_path in excluded:
+                if candidate == excluded_path or candidate.startswith(excluded_path + os.sep):
+                    return True
+            return False
+
         for dirpath, dirnames, filenames in os.walk(root_path):
+            if is_excluded(dirpath):
+                dirnames[:] = []
+                continue
+
+            dirnames[:] = [
+                dirname
+                for dirname in dirnames
+                if not is_excluded(os.path.join(dirpath, dirname))
+            ]
+
             for filename in filenames:
                 file_path = os.path.join(dirpath, filename)
                 
@@ -550,6 +803,7 @@ class MergeOrchestrator:
     
     def __init__(self, max_file_size_kb=800, max_output_files=300, 
                  process_pdfs=True, process_docx=True, process_emails=True):
+        self.max_file_size_kb = max_file_size_kb
         self.pdf_merger = PDFMerger(max_file_size_kb)
         self.docx_merger = DOCXMerger(max_file_size_kb)
         self.email_extractor = EmailExtractor()
@@ -573,14 +827,26 @@ class MergeOrchestrator:
             Dict with merge statistics
         """
         print(f"\nAnalyzing folder structure: {input_path}")
-        
+
+        os.makedirs(output_path, exist_ok=True)
+
+        input_abs = os.path.normcase(os.path.abspath(input_path))
+        output_abs = os.path.normcase(os.path.abspath(output_path))
+        exclude_paths = []
+        if output_abs == input_abs or output_abs.startswith(input_abs + os.sep):
+            exclude_paths.append(output_path)
+            print(f"Excluding output folder from scan: {output_path}")
+
         # Analyze folder structure
-        groups = self.folder_analyzer.analyze_structure(input_path)
+        groups = self.folder_analyzer.analyze_structure(input_path, exclude_paths=exclude_paths)
         
         print(f"Found {len(groups)} groups to process")
         
         output_files = []
         file_count = 0
+        warnings = []
+        errors = []
+        total_input_files = sum(len(files) for files in groups.values())
         
         for group_name, files in sorted(groups.items()):
             print(f"\nProcessing group: {group_name}")
@@ -593,43 +859,102 @@ class MergeOrchestrator:
             # Merge PDFs
             if pdfs and self.process_pdfs:
                 print(f"  Merging {len(pdfs)} PDF files...")
-                pdf_outputs = self.pdf_merger.merge_pdfs(pdfs, output_path, group_name)
+                required_pdf_outputs = self.pdf_merger.estimate_batch_count(pdfs)
+                self._ensure_output_capacity(
+                    required_pdf_outputs,
+                    len(output_files),
+                    f"group '{group_name}' PDF files",
+                )
+                pdf_outputs = self.pdf_merger.merge_pdfs(
+                    pdfs,
+                    output_path,
+                    group_name,
+                    warnings=warnings,
+                )
                 output_files.extend(pdf_outputs)
             
             # Merge DOCX
             if docx and self.process_docx:
                 print(f"  Merging {len(docx)} document files...")
-                docx_outputs = self.docx_merger.merge_docx(docx, output_path, group_name)
+                required_docx_outputs = self.docx_merger.estimate_batch_count(docx)
+                self._ensure_output_capacity(
+                    required_docx_outputs,
+                    len(output_files),
+                    f"group '{group_name}' document files",
+                )
+                docx_outputs = self.docx_merger.merge_docx(
+                    docx,
+                    output_path,
+                    group_name,
+                    warnings=warnings,
+                )
                 output_files.extend(docx_outputs)
             
             # Merge emails
             if emails and self.process_emails:
                 print(f"  Processing {len(emails)} email files...")
-                email_outputs = self._process_emails(emails, output_path, group_name)
+                email_threads = self._prepare_email_threads(emails, warnings=warnings)
+                self._ensure_output_capacity(
+                    len(email_threads),
+                    len(output_files),
+                    f"group '{group_name}' email threads",
+                )
+                email_outputs = self._write_email_threads(email_threads, output_path, group_name)
                 output_files.extend(email_outputs)
             
             file_count += len(files)
             
             if progress_callback:
-                progress_callback(file_count, len(files), f"Processed {group_name}")
+                progress_callback(file_count, total_input_files, f"Processed {group_name}")
         
         # Generate manifest
         manifest_path = os.path.join(output_path, 'merge_manifest.json')
         manifest = {
             'timestamp': datetime.now().isoformat(),
             'input_path': input_path,
-            'total_input_files': file_count,
+            'total_input_files': total_input_files,
             'total_output_files': len(output_files),
-            'output_files': output_files
+            'output_files': output_files,
+            'limits': {
+                'max_file_size_kb': self.max_file_size_kb,
+                'max_output_files': self.max_output_files,
+            },
         }
+
+        if warnings:
+            manifest['warnings'] = warnings
+        if errors:
+            manifest['errors'] = errors
         
-        with open(manifest_path, 'w') as f:
+        with open(manifest_path, 'w', encoding='utf-8') as f:
             json.dump(manifest, f, indent=2)
         
         return manifest
-    
-    def _process_emails(self, email_files: List[str], output_path: str, group_name: str) -> List[str]:
-        """Process and thread email files"""
+
+    def _ensure_output_capacity(
+        self,
+        required_outputs: int,
+        current_output_count: int,
+        context: str,
+    ) -> None:
+        """Validate that writing the next outputs will stay under the global limit."""
+        if required_outputs <= 0:
+            return
+
+        remaining = self.max_output_files - current_output_count
+        if required_outputs > remaining:
+            raise RuntimeError(
+                f"Output file limit exceeded before processing {context}: "
+                f"requires {required_outputs} file(s), but only {remaining} slot(s) remain "
+                f"(max_output_files={self.max_output_files})."
+            )
+
+    def _prepare_email_threads(
+        self,
+        email_files: List[str],
+        warnings: Optional[List[Dict]] = None,
+    ) -> Dict[str, List[Dict]]:
+        """Extract and group email files into conversation threads."""
         email_data = []
         
         for email_file in email_files:
@@ -641,13 +966,29 @@ class MergeOrchestrator:
             if data:
                 data['file_path'] = email_file
                 email_data.append(data)
+            else:
+                _record_warning(
+                    warnings,
+                    'email_extract_failed',
+                    'Could not parse email file; skipping file',
+                    file=email_file,
+                )
         
         # Group into threads
-        threads = self.email_threader.group_emails(email_data)
-        
+        return self.email_threader.group_emails(email_data)
+
+    def _write_email_threads(
+        self,
+        threads: Dict[str, List[Dict]],
+        output_path: str,
+        group_name: str,
+    ) -> List[str]:
+        """Write grouped email threads to text files."""
+        os.makedirs(output_path, exist_ok=True)
+
         # Write thread files
         output_files = []
-        for thread_num, (thread_key, emails) in enumerate(sorted(threads.items()), 1):
+        for thread_num, (_, emails) in enumerate(sorted(threads.items()), 1):
             output_file = os.path.join(output_path, f"{group_name}_emails_thread{thread_num}.txt")
             
             with open(output_file, 'w', encoding='utf-8') as f:
@@ -672,3 +1013,8 @@ class MergeOrchestrator:
             print(f"    Created: {os.path.basename(output_file)} ({len(emails)} emails)")
         
         return output_files
+
+    def _process_emails(self, email_files: List[str], output_path: str, group_name: str) -> List[str]:
+        """Backward-compatible wrapper for email processing."""
+        email_threads = self._prepare_email_threads(email_files)
+        return self._write_email_threads(email_threads, output_path, group_name)

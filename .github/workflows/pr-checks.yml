@@ -39,7 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements_gui.txt ]; then pip install -r requirements_gui.txt; fi
-          pip install flake8 pylint
+          pip install flake8 pylint pytest
           
       - name: Lint with flake8
         run: |
