@@ -4,4 +4,5 @@ extract-msg>=0.45.0
 python-dateutil>=2.8.2
 Pillow>=10.0.0
 olefile>=0.46
+pywin32>=306; platform_system=="Windows"
 

@@ -7,7 +7,10 @@ import os
 import json
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+import shutil
+import tempfile
+import uuid
+from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 import re
 
@@ -42,6 +45,14 @@ try:
 except ImportError:
     HAS_EXTRACT_MSG = False
 
+# Microsoft Word automation (Windows)
+try:
+    import pythoncom
+    import win32com.client as win32_client
+    HAS_WIN32COM = True
+except ImportError:
+    HAS_WIN32COM = False
+
 from email import policy
 from email.parser import BytesParser
 from dateutil import parser as date_parser
@@ -56,10 +67,126 @@ def _record_warning(warnings: Optional[List[Dict]], code: str, message: str, **c
     warnings.append(warning)
 
 
+def _make_writable_temp_dir(prefix: str) -> str:
+    """
+    Create a writable temporary directory.
+    Some Windows/Python builds can produce temp dirs that are not writable when
+    created with tempfile.mkdtemp(mode=0o700 semantics).
+    """
+    base_candidates = [tempfile.gettempdir(), os.getcwd()]
+
+    for base_dir in base_candidates:
+        if not base_dir:
+            continue
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+        except OSError:
+            continue
+
+        for _ in range(8):
+            candidate = os.path.join(base_dir, f"{prefix}{uuid.uuid4().hex}")
+            try:
+                os.makedirs(candidate, exist_ok=False)
+                probe = os.path.join(candidate, ".write_probe")
+                with open(probe, "wb") as handle:
+                    handle.write(b"ok")
+                os.remove(probe)
+                return candidate
+            except OSError:
+                shutil.rmtree(candidate, ignore_errors=True)
+
+    raise RuntimeError("Unable to create a writable temporary directory.")
+
+
+class WordToPdfConverter:
+    """Converts .doc/.docx files to PDF using Microsoft Word COM automation."""
+
+    def __init__(self, warnings: Optional[List[Dict]] = None):
+        self.warnings = warnings
+        self.word_app = None
+        self.com_initialized = False
+
+    @staticmethod
+    def is_available() -> Tuple[bool, str]:
+        if os.name != 'nt':
+            return False, "Word conversion is supported on Windows only."
+        if not HAS_WIN32COM:
+            return False, "pywin32 is required for Word-to-PDF conversion."
+        return True, ""
+
+    def __enter__(self):
+        pythoncom.CoInitialize()
+        self.com_initialized = True
+        self.word_app = win32_client.DispatchEx("Word.Application")
+        self.word_app.Visible = False
+        self.word_app.DisplayAlerts = 0
+        try:
+            # 3 == msoAutomationSecurityForceDisable
+            self.word_app.AutomationSecurity = 3
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.word_app is not None:
+            try:
+                self.word_app.Quit()
+            except Exception:
+                pass
+            self.word_app = None
+        if self.com_initialized:
+            pythoncom.CoUninitialize()
+            self.com_initialized = False
+        return False
+
+    def convert_file(self, source_path: str, output_pdf_path: str) -> bool:
+        """Convert a single Word document to PDF. Returns True on success."""
+        if self.word_app is None:
+            raise RuntimeError("Word automation session is not initialized.")
+
+        document = None
+        try:
+            os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
+            input_abs = os.path.abspath(source_path)
+            output_abs = os.path.abspath(output_pdf_path)
+
+            document = self.word_app.Documents.Open(
+                input_abs,
+                ReadOnly=True,
+                AddToRecentFiles=False,
+                Visible=False,
+                ConfirmConversions=False,
+            )
+
+            # wdExportFormatPDF = 17
+            if hasattr(document, "ExportAsFixedFormat"):
+                document.ExportAsFixedFormat(output_abs, 17)
+            else:
+                # Fallback for older Office object models.
+                document.SaveAs(output_abs, FileFormat=17)
+
+            return os.path.exists(output_abs) and os.path.getsize(output_abs) > 0
+        except Exception as exc:
+            _record_warning(
+                self.warnings,
+                'word_to_pdf_failed',
+                'Word-to-PDF conversion failed; skipping file',
+                file=source_path,
+                error=str(exc),
+            )
+            return False
+        finally:
+            if document is not None:
+                try:
+                    document.Close(SaveChanges=False)
+                except Exception:
+                    pass
+
+
 class PDFMerger:
     """Merges multiple PDF files into batched output files"""
     
-    def __init__(self, max_file_size_kb=800):
+    def __init__(self, max_file_size_kb=102400):
         self.max_file_size_kb = max_file_size_kb
         self.max_file_size_bytes = max_file_size_kb * 1024
         
@@ -93,6 +220,10 @@ class PDFMerger:
         output_path: str,
         group_name: str,
         warnings: Optional[List[Dict]] = None,
+        output_label: str = "pdfs",
+        bookmark_titles: Optional[Dict[str, str]] = None,
+        source_file_map: Optional[Dict[str, str]] = None,
+        output_to_sources: Optional[Dict[str, List[str]]] = None,
     ) -> List[str]:
         """
         Merge PDF files into batches, staying under size limit
@@ -134,7 +265,15 @@ class PDFMerger:
             # If adding this file would exceed limit, save current batch
             if current_batch and (current_batch_size + file_size > self.max_file_size_bytes):
                 output_file = self._save_pdf_batch(
-                    current_batch, output_path, group_name, batch_num, warnings
+                    current_batch,
+                    output_path,
+                    group_name,
+                    batch_num,
+                    warnings,
+                    output_label=output_label,
+                    bookmark_titles=bookmark_titles,
+                    source_file_map=source_file_map,
+                    output_to_sources=output_to_sources,
                 )
                 if output_file:
                     output_files.append(output_file)
@@ -148,7 +287,15 @@ class PDFMerger:
         # Save remaining files
         if current_batch:
             output_file = self._save_pdf_batch(
-                current_batch, output_path, group_name, batch_num, warnings
+                current_batch,
+                output_path,
+                group_name,
+                batch_num,
+                warnings,
+                output_label=output_label,
+                bookmark_titles=bookmark_titles,
+                source_file_map=source_file_map,
+                output_to_sources=output_to_sources,
             )
             if output_file:
                 output_files.append(output_file)
@@ -266,15 +413,32 @@ class PDFMerger:
         group_name: str,
         batch_num: int,
         warnings: Optional[List[Dict]] = None,
+        output_label: str = "pdfs",
+        bookmark_titles: Optional[Dict[str, str]] = None,
+        source_file_map: Optional[Dict[str, str]] = None,
+        output_to_sources: Optional[Dict[str, List[str]]] = None,
     ) -> Optional[str]:
         """Save a batch of PDFs into a single merged PDF"""
         writer = PdfWriter()
         total_pages_added = 0
+        merged_batch_sources: List[str] = []
+
+        def add_bookmark(title: str, page_index: int) -> None:
+            if page_index < 0:
+                return
+            try:
+                writer.add_outline_item(title, page_index)
+            except Exception:
+                try:
+                    writer.addBookmark(title, page_index)
+                except Exception:
+                    pass
         
         # Add all pages from all PDFs
         for pdf_file in pdf_files:
             try:
                 reader = PdfReader(pdf_file)
+                page_start = total_pages_added
                 file_pages_added = 0
                 for page in reader.pages:
                     writer.add_page(page)
@@ -286,6 +450,10 @@ class PDFMerger:
                         'PDF contained zero readable pages',
                         file=pdf_file,
                     )
+                else:
+                    if bookmark_titles and bookmark_titles.get(pdf_file):
+                        add_bookmark(bookmark_titles[pdf_file], page_start)
+                    merged_batch_sources.append(pdf_file)
                 total_pages_added += file_pages_added
             except Exception as e:
                 # Fallback 1: File may be an image with a .pdf extension
@@ -296,6 +464,7 @@ class PDFMerger:
                 if pdf_bytes:
                     try:
                         reader = PdfReader(io.BytesIO(pdf_bytes))
+                        page_start = total_pages_added
                         converted_pages = 0
                         for page in reader.pages:
                             writer.add_page(page)
@@ -308,6 +477,10 @@ class PDFMerger:
                                 'Fallback conversion produced zero pages',
                                 file=pdf_file,
                             )
+                        else:
+                            if bookmark_titles and bookmark_titles.get(pdf_file):
+                                add_bookmark(bookmark_titles[pdf_file], page_start)
+                            merged_batch_sources.append(pdf_file)
                     except Exception as e2:
                         _record_warning(
                             warnings,
@@ -340,8 +513,16 @@ class PDFMerger:
             return None
         
         # Generate output filename
-        output_filename = f"{group_name}_pdfs_batch{batch_num}.pdf"
+        output_filename = f"{group_name}_{output_label}_batch{batch_num}.pdf"
         output_file = os.path.join(output_path, output_filename)
+
+        if output_to_sources is not None:
+            mapped_sources: List[str] = []
+            for merged_source in merged_batch_sources:
+                original = source_file_map.get(merged_source, merged_source) if source_file_map else merged_source
+                if original not in mapped_sources:
+                    mapped_sources.append(original)
+            output_to_sources[output_file] = mapped_sources
         
         # Write merged PDF
         with open(output_file, 'wb') as f:
@@ -354,7 +535,7 @@ class PDFMerger:
 class DOCXMerger:
     """Merges multiple DOCX files into batched output files"""
     
-    def __init__(self, max_file_size_kb=800):
+    def __init__(self, max_file_size_kb=102400):
         self.max_file_size_kb = max_file_size_kb
         self.max_file_size_bytes = max_file_size_kb * 1024
         
@@ -801,14 +982,14 @@ class FolderAnalyzer:
 class MergeOrchestrator:
     """Coordinates the entire merging process"""
     
-    def __init__(self, max_file_size_kb=800, max_output_files=300, 
+    def __init__(self, max_file_size_kb=102400, max_output_files=300, 
                  process_pdfs=True, process_docx=True, process_emails=True):
         self.max_file_size_kb = max_file_size_kb
         self.pdf_merger = PDFMerger(max_file_size_kb)
-        self.docx_merger = DOCXMerger(max_file_size_kb)
         self.email_extractor = EmailExtractor()
         self.email_threader = EmailThreader()
         self.folder_analyzer = FolderAnalyzer()
+        self.word_converter_factory = WordToPdfConverter
         self.max_output_files = max_output_files
         self.process_pdfs = process_pdfs
         self.process_docx = process_docx
@@ -846,6 +1027,12 @@ class MergeOrchestrator:
         file_count = 0
         warnings = []
         errors = []
+        output_to_sources = {}
+        word_conversion_summary = {
+            'attempted': 0,
+            'converted': 0,
+            'failed': 0,
+        }
         total_input_files = sum(len(files) for files in groups.values())
         
         for group_name, files in sorted(groups.items()):
@@ -853,7 +1040,7 @@ class MergeOrchestrator:
             
             # Categorize files by type
             pdfs = [f for f in files if f.lower().endswith('.pdf')]
-            docx = [f for f in files if f.lower().endswith(('.docx', '.doc'))]
+            word_docs = [f for f in files if f.lower().endswith(('.docx', '.doc'))]
             emails = [f for f in files if f.lower().endswith(('.msg', '.eml'))]
             
             # Merge PDFs
@@ -873,22 +1060,21 @@ class MergeOrchestrator:
                 )
                 output_files.extend(pdf_outputs)
             
-            # Merge DOCX
-            if docx and self.process_docx:
-                print(f"  Merging {len(docx)} document files...")
-                required_docx_outputs = self.docx_merger.estimate_batch_count(docx)
-                self._ensure_output_capacity(
-                    required_docx_outputs,
-                    len(output_files),
-                    f"group '{group_name}' document files",
-                )
-                docx_outputs = self.docx_merger.merge_docx(
-                    docx,
+            # Process Word documents as PDF
+            if word_docs and self.process_docx:
+                print(f"  Processing {len(word_docs)} Word document files...")
+                doc_outputs, doc_output_to_sources, conversion_summary = self._process_word_documents(
+                    word_docs,
                     output_path,
                     group_name,
+                    len(output_files),
                     warnings=warnings,
                 )
-                output_files.extend(docx_outputs)
+                output_files.extend(doc_outputs)
+                output_to_sources.update(doc_output_to_sources)
+                word_conversion_summary['attempted'] += conversion_summary['attempted']
+                word_conversion_summary['converted'] += conversion_summary['converted']
+                word_conversion_summary['failed'] += conversion_summary['failed']
             
             # Merge emails
             if emails and self.process_emails:
@@ -925,11 +1111,88 @@ class MergeOrchestrator:
             manifest['warnings'] = warnings
         if errors:
             manifest['errors'] = errors
+        if output_to_sources:
+            manifest['output_to_sources'] = output_to_sources
+        if word_conversion_summary['attempted'] > 0:
+            manifest['word_conversion'] = word_conversion_summary
         
         with open(manifest_path, 'w', encoding='utf-8') as f:
             json.dump(manifest, f, indent=2)
         
         return manifest
+
+    def _process_word_documents(
+        self,
+        word_files: List[str],
+        output_path: str,
+        group_name: str,
+        current_output_count: int,
+        warnings: Optional[List[Dict]] = None,
+    ) -> Tuple[List[str], Dict[str, List[str]], Dict[str, int]]:
+        """Convert .doc/.docx files to PDF, then merge converted PDFs."""
+        word_files = sorted(word_files)
+        conversion_summary = {
+            'attempted': len(word_files),
+            'converted': 0,
+            'failed': 0,
+        }
+
+        available, reason = self.word_converter_factory.is_available()
+        if not available:
+            raise RuntimeError(
+                "Word document processing requires Microsoft Word automation. "
+                f"Details: {reason}"
+            )
+
+        conversion_dir = _make_writable_temp_dir(prefix=f"word_pdf_{group_name}_")
+        converted_pdf_files: List[str] = []
+        source_file_map: Dict[str, str] = {}
+        bookmark_titles: Dict[str, str] = {}
+
+        try:
+            with self.word_converter_factory(warnings=warnings) as converter:
+                for source_file in word_files:
+                    converted_pdf = os.path.join(conversion_dir, f"{uuid.uuid4().hex}.pdf")
+                    converted = converter.convert_file(source_file, converted_pdf)
+                    if converted:
+                        conversion_summary['converted'] += 1
+                        converted_pdf_files.append(converted_pdf)
+                        source_file_map[converted_pdf] = source_file
+                        bookmark_titles[converted_pdf] = os.path.basename(source_file)
+                    else:
+                        conversion_summary['failed'] += 1
+
+            if not converted_pdf_files:
+                _record_warning(
+                    warnings,
+                    'word_conversion_no_outputs',
+                    'No Word documents could be converted to PDF in this group',
+                    group=group_name,
+                    attempted=len(word_files),
+                )
+                return [], {}, conversion_summary
+
+            required_outputs = self.pdf_merger.estimate_batch_count(converted_pdf_files)
+            self._ensure_output_capacity(
+                required_outputs,
+                current_output_count,
+                f"group '{group_name}' Word document files",
+            )
+
+            output_to_sources: Dict[str, List[str]] = {}
+            doc_outputs = self.pdf_merger.merge_pdfs(
+                converted_pdf_files,
+                output_path,
+                group_name,
+                warnings=warnings,
+                output_label="documents",
+                bookmark_titles=bookmark_titles,
+                source_file_map=source_file_map,
+                output_to_sources=output_to_sources,
+            )
+            return doc_outputs, output_to_sources, conversion_summary
+        finally:
+            shutil.rmtree(conversion_dir, ignore_errors=True)
 
     def _ensure_output_capacity(
         self,

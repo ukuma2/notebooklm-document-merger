@@ -3,7 +3,8 @@ import pytest
 from merger_engine import MergeOrchestrator
 
 
-def test_orchestrator_enforces_max_output_files_across_types(tmp_path, make_pdf, make_docx, make_eml):
+def test_orchestrator_enforces_max_output_files_across_types(tmp_path, make_pdf, make_docx, make_eml, patch_word_converter):
+    patch_word_converter()
     input_dir = tmp_path / "input"
     input_dir.mkdir()
 

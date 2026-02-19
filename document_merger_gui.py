@@ -23,7 +23,8 @@ class DocumentMergerGUI:
         # Variables
         self.input_folder = tk.StringVar()
         self.output_folder = tk.StringVar()
-        self.max_file_size = tk.IntVar(value=800)
+        # Default batch target: 100 MB (in KB)
+        self.max_file_size = tk.IntVar(value=102400)
         self.max_output_files = tk.IntVar(value=300)
         
         self.process_pdfs = tk.BooleanVar(value=True)
@@ -101,7 +102,7 @@ class DocumentMergerGUI:
         settings_frame.grid(row=5, column=0, columnspan=2, sticky='ew', pady=(0, 15))
         
         tk.Label(settings_frame, text="Max File Size (KB):").grid(row=0, column=0, sticky='w', padx=(0, 10))
-        tk.Spinbox(settings_frame, from_=100, to=5000, textvariable=self.max_file_size, width=10).grid(
+        tk.Spinbox(settings_frame, from_=1, to=99999999, textvariable=self.max_file_size, width=10).grid(
             row=0, column=1, sticky='w'
         )
         
