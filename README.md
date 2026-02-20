@@ -9,7 +9,7 @@
 
 ### Smart Format Preservation
 - **📄 PDFs** → Merged natively (preserves scanned images, no OCR needed!)
-- **📝 DOCX** → Merged natively (preserves formatting, tables, images)
+- **📝 Word (.doc/.docx)** → Converted with Microsoft Word to PDF, then merged as PDF batches
 - **📧 Emails** → Intelligently threaded by conversation
 
 ### User-Friendly GUI
@@ -20,7 +20,7 @@
 
 ### NotebookLM Optimized
 - Stays under 300-file upload limit
-- Configurable batch sizes (default: 800KB)
+- Configurable batch sizes (default: 100MB / 102400KB)
 - Generates tracking manifest
 
 ---
@@ -60,12 +60,12 @@
    python document_merger_gui.py
    ```
 
-2. **Select your folders**:
-   - Click "Browse..." to choose input folder (containing your documents)
+2. **Select your input/output**:
+   - Use `Folder...` to choose an input folder, or `ZIP...` to choose a single ZIP archive
    - Choose output folder (where merged files will be saved)
 
 3. **Configure settings** (optional):
-   - Select file types to process (PDFs, DOCX, Emails)
+   - Select file types to process (PDFs, Word docs, Emails)
    - Adjust max file size and output limits
 
 4. **Start merging**:
@@ -89,10 +89,16 @@ Input/
 
 Output/
 ├── Case1_pdfs_batch1.pdf
-├── Case1_documents_batch1.docx
+├── Case1_documents_batch1.pdf
 ├── Case1_emails_thread1.txt
 └── merge_manifest.json
 ```
+
+Output folders are always structured as:
+- `processed/` (merged outputs + `merge_manifest.json`)
+- `unprocessed/` (moved unsupported ZIP-extracted files)
+- `failed/` (file-level failure artifacts/metadata)
+- `logs/` (run text + JSONL logs)
 
 ---
 
@@ -101,11 +107,12 @@ Output/
 ### Intelligent Merging Strategy
 
 1. **Folder Analysis**: Auto-detects folder structure and grouping
-2. **File Categorization**: Separates PDFs, DOCX, and emails
-3. **Smart Batching**: Monitors file sizes and creates batches under limits
-4. **Format Preservation**: 
+2. **ZIP Preprocessing**: Auto-extracts `.zip` archives with long-filename truncation for Windows compatibility
+3. **File Categorization**: Separates PDFs, Word documents, and emails
+4. **Smart Batching**: Monitors file sizes and creates batches under limits
+5. **Format Preservation**: 
    - PDFs merged using pypdf (preserves everything including scanned images)
-   - DOCX merged using python-docx (preserves formatting and embedded content)
+   - Word files are converted with Microsoft Word to PDF, then merged via the PDF pipeline
    - Emails threaded by conversation and extracted to text
 
 ### Email Threading
@@ -115,6 +122,13 @@ Emails are intelligently grouped:
 - Groups by conversation
 - Sorts chronologically
 - Preserves all metadata
+
+### ZIP Archive Processing
+
+- ZIP archives are processed automatically alongside normal files
+- Entry names are truncated to 50 characters by default (including extension)
+- Nested ZIP archives are extracted one level deep
+- ZIP contents are grouped under a synthetic group name based on the ZIP filename (for example: `root_Emails-49431`)
 
 ---
 
@@ -170,9 +184,9 @@ To create a `.exe` file that doesn't require Python:
 - Some encrypted PDFs may not merge
 - Check console for specific error messages
 
-**Q: DOCX formatting issues**
-- Complex formatting may not transfer perfectly
-- Basic styles, tables, and images are preserved
+**Q: Word document quality issues**
+- Use Windows with Microsoft Word installed for highest-fidelity `.doc/.docx` conversion
+- Failed conversions are skipped and recorded as warnings in `processed/merge_manifest.json`
 
 **Q: Emoji characters not displaying properly**
 - The GUI uses Unicode emojis (📄, 📝, 📧, 🚀) which may not render on older systems
@@ -185,9 +199,21 @@ To create a `.exe` file that doesn't require Python:
 
 ### Dependencies
 - **pypdf** (≥4.0.0): PDF merging
-- **python-docx** (≥1.1.0): DOCX creation/merging
+- **pywin32** (Windows only): Microsoft Word automation for Word-to-PDF conversion
 - **extract-msg** (≥0.45.0): Outlook MSG parsing
 - **python-dateutil** (≥2.8.2): Date parsing
+
+### ZIP Defaults
+- ZIP preprocessing is enabled by default
+- ZIP filename limit: 50 characters (including extension)
+- Nested ZIP extraction depth: 1 level
+
+### Real-Data ZIP Smoke Check
+Run this command to validate ZIP handling against your large archive outside CI:
+
+```bash
+python tests/smoke_zip_real_data.py --zip Emails-49431.zip --workdir ._tmp_zip_real_smoke
+```
 
 ### System Requirements
 - Python 3.8+
@@ -272,8 +298,8 @@ For repository maintainers, recommended branch protection rules for `main`:
 
 ## Operational Known Limits
 
-- Password-protected or heavily malformed PDFs may be skipped and reported in `merge_manifest.json`.
-- Legacy Word `.doc` recovery is best-effort text extraction and may not preserve layout fidelity.
+- Password-protected or heavily malformed PDFs may be skipped and reported in `processed/merge_manifest.json`.
+- Word conversion requires Microsoft Word on Windows; files that fail conversion are skipped with warnings.
 - Very large source sets can exceed `Max Output Files`; the run stops with a clear limit error before writing excess files.
 - If output is placed inside input, the output folder is automatically excluded from scanning to prevent re-processing generated files.
 - Email threading is subject-based and date-sorted; missing or invalid dates are treated as oldest items in a thread.

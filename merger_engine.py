@@ -7,7 +7,12 @@ import os
 import json
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+import shutil
+import tempfile
+import uuid
+import zipfile
+import traceback
+from typing import List, Dict, Optional, Tuple, Set
 from collections import defaultdict
 import re
 
@@ -42,6 +47,14 @@ try:
 except ImportError:
     HAS_EXTRACT_MSG = False
 
+# Microsoft Word automation (Windows)
+try:
+    import pythoncom
+    import win32com.client as win32_client
+    HAS_WIN32COM = True
+except ImportError:
+    HAS_WIN32COM = False
+
 from email import policy
 from email.parser import BytesParser
 from dateutil import parser as date_parser
@@ -56,10 +69,204 @@ def _record_warning(warnings: Optional[List[Dict]], code: str, message: str, **c
     warnings.append(warning)
 
 
+def _make_writable_temp_dir(prefix: str) -> str:
+    """
+    Create a writable temporary directory.
+    Some Windows/Python builds can produce temp dirs that are not writable when
+    created with tempfile.mkdtemp(mode=0o700 semantics).
+    """
+    base_candidates = [tempfile.gettempdir(), os.getcwd()]
+
+    for base_dir in base_candidates:
+        if not base_dir:
+            continue
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+        except OSError:
+            continue
+
+        for _ in range(8):
+            candidate = os.path.join(base_dir, f"{prefix}{uuid.uuid4().hex}")
+            try:
+                os.makedirs(candidate, exist_ok=False)
+                probe = os.path.join(candidate, ".write_probe")
+                with open(probe, "wb") as handle:
+                    handle.write(b"ok")
+                os.remove(probe)
+                return candidate
+            except OSError:
+                shutil.rmtree(candidate, ignore_errors=True)
+
+    raise RuntimeError("Unable to create a writable temporary directory.")
+
+
+class RunLogger:
+    """Persist run events to text and JSONL logs."""
+
+    def __init__(self, logs_dir: str, run_id: str, enabled: bool = True, privacy_mode: str = "redacted"):
+        self.enabled = enabled
+        self.privacy_mode = privacy_mode
+        self.run_id = run_id
+        self.logs_dir = logs_dir
+        self.text_log_path = os.path.join(logs_dir, f"run_{run_id}.log")
+        self.jsonl_log_path = os.path.join(logs_dir, f"run_{run_id}.jsonl")
+        self._text_handle = None
+        self._jsonl_handle = None
+
+        if self.enabled:
+            os.makedirs(self.logs_dir, exist_ok=True)
+            self._text_handle = open(self.text_log_path, "a", encoding="utf-8")
+            self._jsonl_handle = open(self.jsonl_log_path, "a", encoding="utf-8")
+
+    def close(self) -> None:
+        for handle in (self._text_handle, self._jsonl_handle):
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
+    def _redact_value(self, key: str, value):
+        if self.privacy_mode != "redacted":
+            return value
+        if isinstance(value, str) and key.lower() in {"file", "source", "destination", "archive", "entry", "path"}:
+            return os.path.basename(value)
+        return value
+
+    def _sanitize_context(self, context: Dict) -> Dict:
+        sanitized = {}
+        for key, value in context.items():
+            sanitized[key] = self._redact_value(key, value)
+        return sanitized
+
+    def log(self, level: str, event: str, message: str, **context) -> None:
+        if not self.enabled:
+            return
+        timestamp = datetime.now().isoformat()
+        safe_context = self._sanitize_context(context)
+        payload = {
+            "ts": timestamp,
+            "run_id": self.run_id,
+            "level": level.upper(),
+            "event": event,
+            "message": message,
+            "context": safe_context,
+        }
+        self._jsonl_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._jsonl_handle.flush()
+
+        text_context = ""
+        if safe_context:
+            context_parts = [f"{key}={value}" for key, value in sorted(safe_context.items())]
+            text_context = " | " + ", ".join(context_parts)
+        self._text_handle.write(f"[{timestamp}] {level.upper()} {event}: {message}{text_context}\n")
+        self._text_handle.flush()
+
+
+class WordToPdfConverter:
+    """Converts .doc/.docx files to PDF using Microsoft Word COM automation."""
+
+    def __init__(self, warnings: Optional[List[Dict]] = None):
+        self.warnings = warnings
+        self.word_app = None
+        self.com_initialized = False
+
+    @staticmethod
+    def is_available() -> Tuple[bool, str]:
+        if os.name != 'nt':
+            return False, "Word conversion is supported on Windows only."
+        if not HAS_WIN32COM:
+            return False, "pywin32 is required for Word-to-PDF conversion."
+        return True, ""
+
+    def __enter__(self):
+        pythoncom.CoInitialize()
+        self.com_initialized = True
+        try:
+            self.word_app = win32_client.DispatchEx("Word.Application")
+            self.word_app.Visible = False
+            self.word_app.DisplayAlerts = 0
+            try:
+                # 3 == msoAutomationSecurityForceDisable
+                self.word_app.AutomationSecurity = 3
+            except Exception:
+                # If setting AutomationSecurity fails, continue with defaults.
+                pass
+            return self
+        except Exception:
+            # Ensure COM is uninitialized if initialization fails after CoInitialize.
+            if self.word_app is not None:
+                try:
+                    self.word_app.Quit()
+                except Exception:
+                    pass
+                finally:
+                    self.word_app = None
+            if self.com_initialized:
+                pythoncom.CoUninitialize()
+                self.com_initialized = False
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.word_app is not None:
+            try:
+                self.word_app.Quit()
+            except Exception:
+                pass
+            self.word_app = None
+        if self.com_initialized:
+            pythoncom.CoUninitialize()
+            self.com_initialized = False
+        return False
+
+    def convert_file(self, source_path: str, output_pdf_path: str) -> bool:
+        """Convert a single Word document to PDF. Returns True on success."""
+        if self.word_app is None:
+            raise RuntimeError("Word automation session is not initialized.")
+
+        document = None
+        try:
+            os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
+            input_abs = os.path.abspath(source_path)
+            output_abs = os.path.abspath(output_pdf_path)
+
+            document = self.word_app.Documents.Open(
+                input_abs,
+                ReadOnly=True,
+                AddToRecentFiles=False,
+                Visible=False,
+                ConfirmConversions=False,
+            )
+
+            # wdExportFormatPDF = 17
+            if hasattr(document, "ExportAsFixedFormat"):
+                document.ExportAsFixedFormat(output_abs, 17)
+            else:
+                # Fallback for older Office object models.
+                document.SaveAs(output_abs, FileFormat=17)
+
+            return os.path.exists(output_abs) and os.path.getsize(output_abs) > 0
+        except Exception as exc:
+            _record_warning(
+                self.warnings,
+                'word_to_pdf_failed',
+                'Word-to-PDF conversion failed; skipping file',
+                file=source_path,
+                error=str(exc),
+            )
+            return False
+        finally:
+            if document is not None:
+                try:
+                    document.Close(SaveChanges=False)
+                except Exception:
+                    pass
+
+
 class PDFMerger:
     """Merges multiple PDF files into batched output files"""
     
-    def __init__(self, max_file_size_kb=800):
+    def __init__(self, max_file_size_kb=102400):
         self.max_file_size_kb = max_file_size_kb
         self.max_file_size_bytes = max_file_size_kb * 1024
         
@@ -93,6 +300,10 @@ class PDFMerger:
         output_path: str,
         group_name: str,
         warnings: Optional[List[Dict]] = None,
+        output_label: str = "pdfs",
+        bookmark_titles: Optional[Dict[str, str]] = None,
+        source_file_map: Optional[Dict[str, str]] = None,
+        output_to_sources: Optional[Dict[str, List[str]]] = None,
     ) -> List[str]:
         """
         Merge PDF files into batches, staying under size limit
@@ -134,7 +345,15 @@ class PDFMerger:
             # If adding this file would exceed limit, save current batch
             if current_batch and (current_batch_size + file_size > self.max_file_size_bytes):
                 output_file = self._save_pdf_batch(
-                    current_batch, output_path, group_name, batch_num, warnings
+                    current_batch,
+                    output_path,
+                    group_name,
+                    batch_num,
+                    warnings,
+                    output_label=output_label,
+                    bookmark_titles=bookmark_titles,
+                    source_file_map=source_file_map,
+                    output_to_sources=output_to_sources,
                 )
                 if output_file:
                     output_files.append(output_file)
@@ -148,7 +367,15 @@ class PDFMerger:
         # Save remaining files
         if current_batch:
             output_file = self._save_pdf_batch(
-                current_batch, output_path, group_name, batch_num, warnings
+                current_batch,
+                output_path,
+                group_name,
+                batch_num,
+                warnings,
+                output_label=output_label,
+                bookmark_titles=bookmark_titles,
+                source_file_map=source_file_map,
+                output_to_sources=output_to_sources,
             )
             if output_file:
                 output_files.append(output_file)
@@ -266,15 +493,32 @@ class PDFMerger:
         group_name: str,
         batch_num: int,
         warnings: Optional[List[Dict]] = None,
+        output_label: str = "pdfs",
+        bookmark_titles: Optional[Dict[str, str]] = None,
+        source_file_map: Optional[Dict[str, str]] = None,
+        output_to_sources: Optional[Dict[str, List[str]]] = None,
     ) -> Optional[str]:
         """Save a batch of PDFs into a single merged PDF"""
         writer = PdfWriter()
         total_pages_added = 0
+        merged_batch_sources: List[str] = []
+
+        def add_bookmark(title: str, page_index: int) -> None:
+            if page_index < 0:
+                return
+            try:
+                writer.add_outline_item(title, page_index)
+            except Exception:
+                try:
+                    writer.addBookmark(title, page_index)
+                except Exception:
+                    pass
         
         # Add all pages from all PDFs
         for pdf_file in pdf_files:
             try:
                 reader = PdfReader(pdf_file)
+                page_start = total_pages_added
                 file_pages_added = 0
                 for page in reader.pages:
                     writer.add_page(page)
@@ -286,6 +530,10 @@ class PDFMerger:
                         'PDF contained zero readable pages',
                         file=pdf_file,
                     )
+                else:
+                    if bookmark_titles and bookmark_titles.get(pdf_file):
+                        add_bookmark(bookmark_titles[pdf_file], page_start)
+                    merged_batch_sources.append(pdf_file)
                 total_pages_added += file_pages_added
             except Exception as e:
                 # Fallback 1: File may be an image with a .pdf extension
@@ -296,6 +544,7 @@ class PDFMerger:
                 if pdf_bytes:
                     try:
                         reader = PdfReader(io.BytesIO(pdf_bytes))
+                        page_start = total_pages_added
                         converted_pages = 0
                         for page in reader.pages:
                             writer.add_page(page)
@@ -308,6 +557,10 @@ class PDFMerger:
                                 'Fallback conversion produced zero pages',
                                 file=pdf_file,
                             )
+                        else:
+                            if bookmark_titles and bookmark_titles.get(pdf_file):
+                                add_bookmark(bookmark_titles[pdf_file], page_start)
+                            merged_batch_sources.append(pdf_file)
                     except Exception as e2:
                         _record_warning(
                             warnings,
@@ -340,8 +593,16 @@ class PDFMerger:
             return None
         
         # Generate output filename
-        output_filename = f"{group_name}_pdfs_batch{batch_num}.pdf"
+        output_filename = f"{group_name}_{output_label}_batch{batch_num}.pdf"
         output_file = os.path.join(output_path, output_filename)
+
+        if output_to_sources is not None:
+            mapped_sources: List[str] = []
+            for merged_source in merged_batch_sources:
+                original = source_file_map.get(merged_source, merged_source) if source_file_map else merged_source
+                if original not in mapped_sources:
+                    mapped_sources.append(original)
+            output_to_sources[output_file] = mapped_sources
         
         # Write merged PDF
         with open(output_file, 'wb') as f:
@@ -354,7 +615,7 @@ class PDFMerger:
 class DOCXMerger:
     """Merges multiple DOCX files into batched output files"""
     
-    def __init__(self, max_file_size_kb=800):
+    def __init__(self, max_file_size_kb=102400):
         self.max_file_size_kb = max_file_size_kb
         self.max_file_size_bytes = max_file_size_kb * 1024
         
@@ -798,21 +1059,275 @@ class FolderAnalyzer:
         return dict(groups)
 
 
+class ZipArchiveProcessor:
+    """Extract ZIP archives safely with truncation for long entry names."""
+
+    @staticmethod
+    def _safe_member_path(member_name: str) -> Optional[str]:
+        if not member_name:
+            return None
+
+        normalized = member_name.replace("\\", "/")
+        if normalized.startswith("/"):
+            return None
+        if re.match(r"^[A-Za-z]:", normalized):
+            return None
+
+        had_trailing_slash = normalized.endswith("/")
+        parts = []
+        for part in normalized.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                return None
+            parts.append(part)
+
+        if not parts:
+            return None
+
+        safe_path = "/".join(parts)
+        if had_trailing_slash:
+            safe_path += "/"
+        return safe_path
+
+    @staticmethod
+    def _truncate_leaf_name(name: str, max_len: int, include_ext: bool) -> str:
+        if max_len <= 0:
+            return name
+
+        base, ext = os.path.splitext(name)
+        if include_ext:
+            allowed_base = max(1, max_len - len(ext))
+        else:
+            allowed_base = max_len
+
+        if len(base) > allowed_base:
+            base = base[:allowed_base]
+        return base + ext
+
+    def _unique_path(
+        self,
+        candidate_path: str,
+        used_paths: Set[str],
+        max_len: int,
+        include_ext: bool,
+    ) -> Tuple[str, bool]:
+        if candidate_path not in used_paths:
+            return candidate_path, False
+
+        parts = candidate_path.split("/")
+        leaf_name = parts[-1]
+        dir_prefix = "/".join(parts[:-1])
+        base, ext = os.path.splitext(leaf_name)
+
+        for counter in range(1, 100000):
+            suffix = f"_{counter}"
+            if max_len > 0:
+                if include_ext:
+                    allowed_base = max(1, max_len - len(ext) - len(suffix))
+                else:
+                    allowed_base = max(1, max_len - len(suffix))
+                base_for_counter = base[:allowed_base]
+            else:
+                base_for_counter = base
+
+            next_leaf = f"{base_for_counter}{suffix}{ext}"
+            next_candidate = (
+                f"{dir_prefix}/{next_leaf}" if dir_prefix else next_leaf
+            )
+            if next_candidate not in used_paths:
+                return next_candidate, True
+
+        raise RuntimeError("Unable to resolve ZIP filename collisions.")
+
+    def extract_archive(
+        self,
+        zip_path: str,
+        target_root: str,
+        max_len: int,
+        include_ext: bool,
+        depth: int,
+        depth_limit: int,
+        warnings: Optional[List[Dict]],
+    ) -> Dict:
+        stats = {
+            'archives_extracted': 0,
+            'archives_failed': 0,
+            'entries_total': 0,
+            'entries_extracted': 0,
+            'entries_renamed': 0,
+            'entries_skipped_unsafe_path': 0,
+            'nested_archives_extracted': 0,
+            'nested_archives_skipped_depth': 0,
+            'extracted_files': [],
+        }
+
+        used_paths: Set[str] = set()
+        nested_archives: List[str] = []
+
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_handle:
+                stats['archives_extracted'] += 1
+
+                for entry in zip_handle.infolist():
+                    safe_member = self._safe_member_path(entry.filename)
+                    if safe_member is None:
+                        if not entry.is_dir():
+                            stats['entries_total'] += 1
+                            stats['entries_skipped_unsafe_path'] += 1
+                            _record_warning(
+                                warnings,
+                                'zip_entry_skipped_unsafe_path',
+                                'Skipped ZIP entry with unsafe path',
+                                archive=zip_path,
+                                entry=entry.filename,
+                            )
+                        continue
+
+                    if safe_member.endswith("/"):
+                        continue
+
+                    stats['entries_total'] += 1
+                    member_parts = safe_member.split("/")
+                    leaf_name = member_parts[-1]
+                    parent_parts = member_parts[:-1]
+
+                    truncated_leaf = self._truncate_leaf_name(
+                        leaf_name,
+                        max_len,
+                        include_ext,
+                    )
+                    renamed = truncated_leaf != leaf_name
+                    candidate_rel = "/".join(parent_parts + [truncated_leaf]) if parent_parts else truncated_leaf
+                    unique_rel, renamed_by_collision = self._unique_path(
+                        candidate_rel,
+                        used_paths,
+                        max_len,
+                        include_ext,
+                    )
+                    if renamed or renamed_by_collision:
+                        stats['entries_renamed'] += 1
+                    used_paths.add(unique_rel)
+
+                    target_path = os.path.join(target_root, *unique_rel.split("/"))
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+                    try:
+                        with zip_handle.open(entry) as source_handle:
+                            with open(target_path, 'wb') as target_handle:
+                                shutil.copyfileobj(source_handle, target_handle)
+                        stats['entries_extracted'] += 1
+                    except Exception as exc:
+                        _record_warning(
+                            warnings,
+                            'zip_extract_failed',
+                            'Failed to extract ZIP entry; skipping entry',
+                            archive=zip_path,
+                            entry=entry.filename,
+                            error=str(exc),
+                        )
+                        continue
+
+                    if target_path.lower().endswith('.zip'):
+                        nested_archives.append(target_path)
+                    else:
+                        stats['extracted_files'].append(target_path)
+        except Exception as exc:
+            stats['archives_failed'] += 1
+            _record_warning(
+                warnings,
+                'zip_extract_failed',
+                'Failed to extract ZIP archive; skipping archive',
+                archive=zip_path,
+                error=str(exc),
+            )
+            return stats
+
+        if nested_archives:
+            if depth < depth_limit:
+                for nested_archive in nested_archives:
+                    nested_target = os.path.join(target_root, f"_nested_{uuid.uuid4().hex}")
+                    os.makedirs(nested_target, exist_ok=True)
+                    nested_stats = self.extract_archive(
+                        nested_archive,
+                        nested_target,
+                        max_len=max_len,
+                        include_ext=include_ext,
+                        depth=depth + 1,
+                        depth_limit=depth_limit,
+                        warnings=warnings,
+                    )
+                    stats['archives_extracted'] += nested_stats['archives_extracted']
+                    stats['archives_failed'] += nested_stats['archives_failed']
+                    stats['entries_total'] += nested_stats['entries_total']
+                    stats['entries_extracted'] += nested_stats['entries_extracted']
+                    stats['entries_renamed'] += nested_stats['entries_renamed']
+                    stats['entries_skipped_unsafe_path'] += nested_stats['entries_skipped_unsafe_path']
+                    stats['nested_archives_extracted'] += nested_stats['archives_extracted']
+                    stats['nested_archives_extracted'] += nested_stats['nested_archives_extracted']
+                    stats['nested_archives_skipped_depth'] += nested_stats['nested_archives_skipped_depth']
+                    stats['extracted_files'].extend(nested_stats['extracted_files'])
+            else:
+                for nested_archive in nested_archives:
+                    stats['nested_archives_skipped_depth'] += 1
+                    _record_warning(
+                        warnings,
+                        'zip_nested_depth_exceeded',
+                        'Nested ZIP archive skipped due to depth limit',
+                        archive=nested_archive,
+                        depth=depth,
+                        depth_limit=depth_limit,
+                    )
+
+        return stats
+
+
 class MergeOrchestrator:
     """Coordinates the entire merging process"""
     
-    def __init__(self, max_file_size_kb=800, max_output_files=300, 
-                 process_pdfs=True, process_docx=True, process_emails=True):
+    def __init__(
+        self,
+        max_file_size_kb=102400,
+        max_output_files=300,
+        process_pdfs=True,
+        process_docx=True,
+        process_emails=True,
+        process_zip_archives=True,
+        zip_max_filename_length=50,
+        zip_include_extension_in_limit=True,
+        zip_nested_depth_limit=1,
+        output_layout_mode="structured",
+        processed_subdir="processed",
+        unprocessed_subdir="unprocessed",
+        failed_subdir="failed",
+        logs_subdir="logs",
+        word_progress_interval=10,
+        enable_detailed_logging=True,
+        log_privacy_mode="redacted",
+    ):
         self.max_file_size_kb = max_file_size_kb
         self.pdf_merger = PDFMerger(max_file_size_kb)
-        self.docx_merger = DOCXMerger(max_file_size_kb)
         self.email_extractor = EmailExtractor()
         self.email_threader = EmailThreader()
         self.folder_analyzer = FolderAnalyzer()
+        self.zip_archive_processor = ZipArchiveProcessor()
+        self.word_converter_factory = WordToPdfConverter
         self.max_output_files = max_output_files
         self.process_pdfs = process_pdfs
         self.process_docx = process_docx
         self.process_emails = process_emails
+        self.process_zip_archives = process_zip_archives
+        self.zip_max_filename_length = zip_max_filename_length
+        self.zip_include_extension_in_limit = zip_include_extension_in_limit
+        self.zip_nested_depth_limit = zip_nested_depth_limit
+        self.output_layout_mode = output_layout_mode
+        self.processed_subdir = processed_subdir
+        self.unprocessed_subdir = unprocessed_subdir
+        self.failed_subdir = failed_subdir
+        self.logs_subdir = logs_subdir
+        self.word_progress_interval = max(1, int(word_progress_interval))
+        self.enable_detailed_logging = enable_detailed_logging
+        self.log_privacy_mode = log_privacy_mode
         
     def merge_documents(self, input_path: str, output_path: str, progress_callback=None) -> Dict:
         """
@@ -829,107 +1344,617 @@ class MergeOrchestrator:
         print(f"\nAnalyzing folder structure: {input_path}")
 
         os.makedirs(output_path, exist_ok=True)
+        if self.output_layout_mode == "structured":
+            processed_dir = os.path.join(output_path, self.processed_subdir)
+            unprocessed_dir = os.path.join(output_path, self.unprocessed_subdir)
+            failed_dir = os.path.join(output_path, self.failed_subdir)
+            logs_dir = os.path.join(output_path, self.logs_subdir)
+        else:
+            processed_dir = output_path
+            unprocessed_dir = os.path.join(output_path, self.unprocessed_subdir)
+            failed_dir = os.path.join(output_path, self.failed_subdir)
+            logs_dir = os.path.join(output_path, self.logs_subdir)
 
-        input_abs = os.path.normcase(os.path.abspath(input_path))
-        output_abs = os.path.normcase(os.path.abspath(output_path))
-        exclude_paths = []
-        if output_abs == input_abs or output_abs.startswith(input_abs + os.sep):
-            exclude_paths.append(output_path)
-            print(f"Excluding output folder from scan: {output_path}")
+        for path in (processed_dir, unprocessed_dir, failed_dir, logs_dir):
+            os.makedirs(path, exist_ok=True)
 
-        # Analyze folder structure
-        groups = self.folder_analyzer.analyze_structure(input_path, exclude_paths=exclude_paths)
-        
-        print(f"Found {len(groups)} groups to process")
-        
-        output_files = []
-        file_count = 0
-        warnings = []
-        errors = []
-        total_input_files = sum(len(files) for files in groups.values())
-        
-        for group_name, files in sorted(groups.items()):
-            print(f"\nProcessing group: {group_name}")
-            
-            # Categorize files by type
-            pdfs = [f for f in files if f.lower().endswith('.pdf')]
-            docx = [f for f in files if f.lower().endswith(('.docx', '.doc'))]
-            emails = [f for f in files if f.lower().endswith(('.msg', '.eml'))]
-            
-            # Merge PDFs
-            if pdfs and self.process_pdfs:
-                print(f"  Merging {len(pdfs)} PDF files...")
-                required_pdf_outputs = self.pdf_merger.estimate_batch_count(pdfs)
-                self._ensure_output_capacity(
-                    required_pdf_outputs,
-                    len(output_files),
-                    f"group '{group_name}' PDF files",
-                )
-                pdf_outputs = self.pdf_merger.merge_pdfs(
-                    pdfs,
-                    output_path,
-                    group_name,
-                    warnings=warnings,
-                )
-                output_files.extend(pdf_outputs)
-            
-            # Merge DOCX
-            if docx and self.process_docx:
-                print(f"  Merging {len(docx)} document files...")
-                required_docx_outputs = self.docx_merger.estimate_batch_count(docx)
-                self._ensure_output_capacity(
-                    required_docx_outputs,
-                    len(output_files),
-                    f"group '{group_name}' document files",
-                )
-                docx_outputs = self.docx_merger.merge_docx(
-                    docx,
-                    output_path,
-                    group_name,
-                    warnings=warnings,
-                )
-                output_files.extend(docx_outputs)
-            
-            # Merge emails
-            if emails and self.process_emails:
-                print(f"  Processing {len(emails)} email files...")
-                email_threads = self._prepare_email_threads(emails, warnings=warnings)
-                self._ensure_output_capacity(
-                    len(email_threads),
-                    len(output_files),
-                    f"group '{group_name}' email threads",
-                )
-                email_outputs = self._write_email_threads(email_threads, output_path, group_name)
-                output_files.extend(email_outputs)
-            
-            file_count += len(files)
-            
-            if progress_callback:
-                progress_callback(file_count, total_input_files, f"Processed {group_name}")
-        
-        # Generate manifest
-        manifest_path = os.path.join(output_path, 'merge_manifest.json')
-        manifest = {
-            'timestamp': datetime.now().isoformat(),
-            'input_path': input_path,
-            'total_input_files': total_input_files,
-            'total_output_files': len(output_files),
-            'output_files': output_files,
-            'limits': {
-                'max_file_size_kb': self.max_file_size_kb,
-                'max_output_files': self.max_output_files,
-            },
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+        run_logger = RunLogger(
+            logs_dir=logs_dir,
+            run_id=run_id,
+            enabled=self.enable_detailed_logging,
+            privacy_mode=self.log_privacy_mode,
+        )
+
+        staged_input_root = None
+        working_input_path = input_path
+        output_files: List[str] = []
+        warnings: List[Dict] = []
+        errors: List[Dict] = []
+        output_to_sources: Dict[str, List[str]] = {}
+        moved_unprocessed: List[Dict] = []
+        failed_files: List[Dict] = []
+        skipped_files: List[Dict] = []
+        fatal_exception = None
+        fatal_error_message = ""
+
+        word_conversion_summary = {
+            'attempted': 0,
+            'converted': 0,
+            'failed': 0,
+        }
+        zip_processing_summary = {
+            'archives_found': 0,
+            'archives_extracted': 0,
+            'archives_failed': 0,
+            'entries_total': 0,
+            'entries_extracted': 0,
+            'entries_renamed': 0,
+            'entries_skipped_unsafe_path': 0,
+            'nested_archives_extracted': 0,
+            'nested_archives_skipped_depth': 0,
         }
 
-        if warnings:
-            manifest['warnings'] = warnings
-        if errors:
-            manifest['errors'] = errors
-        
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, indent=2)
-        
+        total_input_files = 0
+        file_count = 0
+        zip_temp_dirs: List[str] = []
+        manifest: Dict = {}
+
+        try:
+            if os.path.isfile(input_path):
+                if not input_path.lower().endswith('.zip'):
+                    raise RuntimeError("Input path must be a folder or .zip file.")
+                staged_input_root = _make_writable_temp_dir(prefix="single_zip_input_")
+                staged_archive = os.path.join(staged_input_root, os.path.basename(input_path))
+                shutil.copy2(input_path, staged_archive)
+                working_input_path = staged_input_root
+            elif not os.path.isdir(input_path):
+                raise RuntimeError("Input path must exist and be accessible.")
+
+            input_abs = os.path.normcase(os.path.abspath(working_input_path))
+            output_abs = os.path.normcase(os.path.abspath(output_path))
+            exclude_paths = []
+            if output_abs == input_abs or output_abs.startswith(input_abs + os.sep):
+                exclude_paths.append(output_path)
+                print(f"Excluding output folder from scan: {output_path}")
+
+            groups = self.folder_analyzer.analyze_structure(working_input_path, exclude_paths=exclude_paths)
+            print(f"Found {len(groups)} groups to process")
+            run_logger.log("info", "groups_analyzed", "Folder analysis complete", group_count=len(groups))
+
+            total_input_files = sum(len(files) for files in groups.values())
+            if staged_input_root:
+                zip_temp_dirs.append(staged_input_root)
+
+            groups, group_file_weights, extracted_zip_temp_dirs, zip_group_meta = self._prepare_groups_with_zip_expansion(
+                groups,
+                warnings=warnings,
+                zip_processing_summary=zip_processing_summary,
+            )
+            zip_temp_dirs.extend(extracted_zip_temp_dirs)
+
+            for group_name, files in sorted(groups.items()):
+                if not files:
+                    continue
+
+                print(f"\nProcessing group: {group_name}")
+                run_logger.log("info", "group_start", "Processing group", group=group_name, file_count=len(files))
+                group_files = sorted(files)
+
+                supported_files = [f for f in group_files if self._is_supported_processable_file(f)]
+                if group_name in zip_group_meta:
+                    unsupported_files = [f for f in group_files if f not in supported_files]
+                    if unsupported_files:
+                        self._move_unsupported_zip_files(
+                            unsupported_files=unsupported_files,
+                            group_name=group_name,
+                            extraction_root=zip_group_meta[group_name]["extraction_root"],
+                            unprocessed_root=unprocessed_dir,
+                            moved_unprocessed=moved_unprocessed,
+                            warnings=warnings,
+                            run_logger=run_logger,
+                        )
+                    group_files = supported_files
+
+                pdfs = [f for f in group_files if f.lower().endswith('.pdf')]
+                word_docs = [f for f in group_files if f.lower().endswith(('.docx', '.doc'))]
+                emails = [f for f in group_files if f.lower().endswith(('.msg', '.eml'))]
+
+                if pdfs and self.process_pdfs:
+                    print(f"  Merging {len(pdfs)} PDF files...")
+                    run_logger.log("info", "pdf_merge_start", "Starting PDF merge", group=group_name, count=len(pdfs))
+                    required_pdf_outputs = self.pdf_merger.estimate_batch_count(pdfs)
+                    self._ensure_output_capacity(
+                        required_pdf_outputs,
+                        len(output_files),
+                        f"group '{group_name}' PDF files",
+                    )
+                    pdf_outputs = self.pdf_merger.merge_pdfs(
+                        pdfs,
+                        processed_dir,
+                        group_name,
+                        warnings=warnings,
+                    )
+                    output_files.extend(pdf_outputs)
+                    run_logger.log("info", "pdf_merge_end", "Completed PDF merge", group=group_name, outputs=len(pdf_outputs))
+
+                if word_docs and self.process_docx:
+                    print(f"  Processing {len(word_docs)} Word document files...")
+                    run_logger.log("info", "word_convert_start", "Starting Word conversion", group=group_name, count=len(word_docs))
+
+                    def word_progress_update(message: str) -> None:
+                        if progress_callback:
+                            progress_callback(file_count, total_input_files, message)
+
+                    doc_outputs, doc_output_to_sources, conversion_summary = self._process_word_documents(
+                        word_docs,
+                        processed_dir,
+                        group_name,
+                        len(output_files),
+                        warnings=warnings,
+                        progress_callback=word_progress_update,
+                        progress_interval=self.word_progress_interval,
+                        run_logger=run_logger,
+                    )
+                    output_files.extend(doc_outputs)
+                    output_to_sources.update(doc_output_to_sources)
+                    word_conversion_summary['attempted'] += conversion_summary['attempted']
+                    word_conversion_summary['converted'] += conversion_summary['converted']
+                    word_conversion_summary['failed'] += conversion_summary['failed']
+                    run_logger.log("info", "word_convert_end", "Completed Word conversion", group=group_name, outputs=len(doc_outputs))
+
+                if emails and self.process_emails:
+                    print(f"  Processing {len(emails)} email files...")
+                    run_logger.log("info", "email_thread_start", "Starting email threading", group=group_name, count=len(emails))
+                    email_threads = self._prepare_email_threads(emails, warnings=warnings)
+                    self._ensure_output_capacity(
+                        len(email_threads),
+                        len(output_files),
+                        f"group '{group_name}' email threads",
+                    )
+                    email_outputs = self._write_email_threads(email_threads, processed_dir, group_name)
+                    output_files.extend(email_outputs)
+                    run_logger.log("info", "email_thread_end", "Completed email threading", group=group_name, outputs=len(email_outputs))
+
+                file_count += group_file_weights.get(group_name, 0)
+                if progress_callback:
+                    progress_callback(file_count, total_input_files, f"Processed {group_name}")
+                run_logger.log("info", "group_end", "Finished group", group=group_name, processed=file_count, total=total_input_files)
+
+            failed_files, skipped_files = self._collect_file_outcomes_from_warnings(warnings)
+        except Exception as exc:
+            fatal_exception = exc
+            fatal_error_message = str(exc)
+            errors.append(
+                {
+                    "code": "infra_unhandled_error",
+                    "message": "Fatal processing error stopped the run",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+            run_logger.log("error", "fatal_error", "Fatal processing error", error=str(exc))
+        finally:
+            for temp_dir in zip_temp_dirs:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+            if not failed_files or not skipped_files:
+                collected_failed, collected_skipped = self._collect_file_outcomes_from_warnings(warnings)
+                if not failed_files:
+                    failed_files = collected_failed
+                if not skipped_files:
+                    skipped_files = collected_skipped
+
+            manifest_path = os.path.join(processed_dir, 'merge_manifest.json')
+            manifest = {
+                'timestamp': datetime.now().isoformat(),
+                'run_id': run_id,
+                'input_path': input_path,
+                'total_input_files': total_input_files,
+                'total_output_files': len(output_files),
+                'output_files': output_files,
+                'limits': {
+                    'max_file_size_kb': self.max_file_size_kb,
+                    'max_output_files': self.max_output_files,
+                },
+                'paths': {
+                    'processed_dir': processed_dir,
+                    'unprocessed_dir': unprocessed_dir,
+                    'failed_dir': failed_dir,
+                    'logs_dir': logs_dir,
+                },
+                'logs': {
+                    'text_log': run_logger.text_log_path,
+                    'jsonl_log': run_logger.jsonl_log_path,
+                },
+                'summary': {
+                    'input_files_total': total_input_files,
+                    'processed_outputs_total': len(output_files),
+                    'moved_unprocessed_total': len(moved_unprocessed),
+                    'failed_files_total': len(failed_files),
+                    'skipped_files_total': len(skipped_files),
+                    'warnings_total': len(warnings),
+                    'errors_total': len(errors),
+                },
+                'files': {
+                    'processed_outputs': output_files,
+                    'moved_unprocessed': moved_unprocessed,
+                    'failed': failed_files,
+                    'skipped': skipped_files,
+                },
+            }
+
+            if warnings:
+                manifest['warnings'] = warnings
+            if errors:
+                manifest['errors'] = errors
+            if output_to_sources:
+                manifest['output_to_sources'] = output_to_sources
+            if word_conversion_summary['attempted'] > 0:
+                manifest['word_conversion'] = word_conversion_summary
+            if zip_processing_summary['archives_found'] > 0:
+                manifest['zip_processing'] = zip_processing_summary
+
+            try:
+                with open(manifest_path, 'w', encoding='utf-8') as f:
+                    json.dump(manifest, f, indent=2)
+                run_logger.log("info", "manifest_written", "Wrote merge manifest", path=manifest_path)
+            finally:
+                run_logger.close()
+
+        if fatal_exception is not None:
+            raise RuntimeError(
+                f"{fatal_error_message}\n"
+                f"Run log: {run_logger.text_log_path}\n"
+                f"Manifest: {os.path.join(processed_dir, 'merge_manifest.json')}"
+            ) from fatal_exception
+
         return manifest
+
+    @staticmethod
+    def _sanitize_group_component(value: str) -> str:
+        normalized = re.sub(r'[^A-Za-z0-9_-]+', '_', value).strip('_')
+        return normalized or 'zip'
+
+    @classmethod
+    def _allocate_zip_group_name(
+        cls,
+        group_name: str,
+        zip_path: str,
+        used_group_names: Set[str],
+    ) -> str:
+        stem = os.path.splitext(os.path.basename(zip_path))[0]
+        zip_component = cls._sanitize_group_component(stem)
+        base_name = f"{group_name}_{zip_component}" if group_name else zip_component
+
+        if base_name not in used_group_names:
+            return base_name
+
+        for counter in range(2, 100000):
+            candidate = f"{base_name}_{counter}"
+            if candidate not in used_group_names:
+                return candidate
+
+        raise RuntimeError("Unable to generate a unique group name for ZIP archive.")
+
+    @staticmethod
+    def _merge_zip_stats(accumulator: Dict[str, int], update: Dict[str, int]) -> None:
+        for key in (
+            'archives_extracted',
+            'archives_failed',
+            'entries_total',
+            'entries_extracted',
+            'entries_renamed',
+            'entries_skipped_unsafe_path',
+            'nested_archives_extracted',
+            'nested_archives_skipped_depth',
+        ):
+            accumulator[key] += update.get(key, 0)
+
+    def _prepare_groups_with_zip_expansion(
+        self,
+        groups: Dict[str, List[str]],
+        warnings: Optional[List[Dict]],
+        zip_processing_summary: Dict[str, int],
+    ) -> Tuple[Dict[str, List[str]], Dict[str, int], List[str], Dict[str, Dict[str, str]]]:
+        expanded_groups: Dict[str, List[str]] = defaultdict(list)
+        group_file_weights: Dict[str, int] = defaultdict(int)
+        temp_dirs: List[str] = []
+        zip_group_meta: Dict[str, Dict[str, str]] = {}
+        used_group_names: Set[str] = set(groups.keys())
+
+        for group_name, files in sorted(groups.items()):
+            sorted_files = sorted(files)
+            zip_files = [path for path in sorted_files if path.lower().endswith('.zip')]
+            non_zip_files = [path for path in sorted_files if not path.lower().endswith('.zip')]
+
+            if non_zip_files:
+                expanded_groups[group_name].extend(non_zip_files)
+                group_file_weights[group_name] += len(non_zip_files)
+
+            if not self.process_zip_archives:
+                group_file_weights[group_name] += len(zip_files)
+                continue
+
+            for zip_file in zip_files:
+                zip_processing_summary['archives_found'] += 1
+                zip_group_name = self._allocate_zip_group_name(
+                    group_name,
+                    zip_file,
+                    used_group_names,
+                )
+                used_group_names.add(zip_group_name)
+                group_file_weights[zip_group_name] += 1
+
+                try:
+                    extraction_root = _make_writable_temp_dir(prefix=f"zip_extract_{zip_group_name}_")
+                except Exception as exc:
+                    zip_processing_summary['archives_failed'] += 1
+                    _record_warning(
+                        warnings,
+                        'zip_extract_failed',
+                        'Failed to prepare extraction directory; skipping archive',
+                        archive=zip_file,
+                        error=str(exc),
+                    )
+                    continue
+
+                temp_dirs.append(extraction_root)
+                extract_result = self.zip_archive_processor.extract_archive(
+                    zip_file,
+                    extraction_root,
+                    max_len=self.zip_max_filename_length,
+                    include_ext=self.zip_include_extension_in_limit,
+                    depth=0,
+                    depth_limit=self.zip_nested_depth_limit,
+                    warnings=warnings,
+                )
+                self._merge_zip_stats(zip_processing_summary, extract_result)
+
+                extracted_files = extract_result.get('extracted_files', [])
+                if extracted_files:
+                    expanded_groups[zip_group_name].extend(extracted_files)
+                    zip_group_meta[zip_group_name] = {
+                        "source_archive": zip_file,
+                        "extraction_root": extraction_root,
+                    }
+                else:
+                    _record_warning(
+                        warnings,
+                        'zip_empty_after_extraction',
+                        'ZIP archive did not contain extractable files',
+                        archive=zip_file,
+                    )
+
+        return dict(expanded_groups), dict(group_file_weights), temp_dirs, zip_group_meta
+
+    @staticmethod
+    def _is_supported_processable_file(file_path: str) -> bool:
+        supported = ('.pdf', '.docx', '.doc', '.msg', '.eml')
+        return file_path.lower().endswith(supported)
+
+    @staticmethod
+    def _ensure_unique_destination(path: str) -> str:
+        if not os.path.exists(path):
+            return path
+        directory, filename = os.path.split(path)
+        base, ext = os.path.splitext(filename)
+        for index in range(1, 100000):
+            candidate = os.path.join(directory, f"{base}_{index}{ext}")
+            if not os.path.exists(candidate):
+                return candidate
+        raise RuntimeError("Unable to allocate destination filename.")
+
+    def _move_unsupported_zip_files(
+        self,
+        unsupported_files: List[str],
+        group_name: str,
+        extraction_root: str,
+        unprocessed_root: str,
+        moved_unprocessed: List[Dict],
+        warnings: Optional[List[Dict]],
+        run_logger: Optional[RunLogger] = None,
+    ) -> None:
+        for source_path in sorted(unsupported_files):
+            try:
+                relative = os.path.relpath(source_path, extraction_root)
+                if relative.startswith(".."):
+                    relative = os.path.basename(source_path)
+            except ValueError:
+                relative = os.path.basename(source_path)
+
+            destination = os.path.join(unprocessed_root, group_name, relative)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            destination = self._ensure_unique_destination(destination)
+
+            try:
+                shutil.move(source_path, destination)
+                entry = {
+                    "source": source_path,
+                    "destination": destination,
+                    "reason": "unsupported_zip_file_moved",
+                }
+                moved_unprocessed.append(entry)
+                if run_logger:
+                    run_logger.log(
+                        "info",
+                        "unsupported_moved",
+                        "Moved unsupported ZIP file",
+                        source=source_path,
+                        destination=destination,
+                        group=group_name,
+                    )
+            except Exception as exc:
+                _record_warning(
+                    warnings,
+                    'unsupported_move_failed',
+                    'Failed to move unsupported ZIP file',
+                    file=source_path,
+                    destination=destination,
+                    error=str(exc),
+                )
+                if run_logger:
+                    run_logger.log(
+                        "warning",
+                        "unsupported_move_failed",
+                        "Failed moving unsupported ZIP file",
+                        source=source_path,
+                        destination=destination,
+                        error=str(exc),
+                    )
+
+    @staticmethod
+    def _collect_file_outcomes_from_warnings(
+        warnings: List[Dict],
+    ) -> Tuple[List[Dict], List[Dict]]:
+        skip_codes = {
+            'zip_entry_skipped_unsafe_path',
+            'zip_nested_depth_exceeded',
+            'zip_empty_after_extraction',
+        }
+        failed = []
+        skipped = []
+        seen = set()
+
+        for warning in warnings:
+            code = warning.get("code", "unknown_warning")
+            message = warning.get("message", "")
+            stage = code.split("_", 1)[0]
+
+            source = warning.get("file")
+            if source is None and warning.get("archive") and warning.get("entry"):
+                source = f"{warning['archive']}::{warning['entry']}"
+            if source is None:
+                source = warning.get("archive") or warning.get("destination")
+            if not source:
+                continue
+
+            item = {
+                "source": source,
+                "code": code,
+                "message": message,
+                "stage": stage,
+            }
+            key = (item["source"], item["code"], item["message"], item["stage"])
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if code in skip_codes:
+                skipped.append(item)
+            else:
+                failed.append(item)
+
+        return failed, skipped
+
+    def _process_word_documents(
+        self,
+        word_files: List[str],
+        output_path: str,
+        group_name: str,
+        current_output_count: int,
+        warnings: Optional[List[Dict]] = None,
+        progress_callback=None,
+        progress_interval: int = 10,
+        run_logger: Optional[RunLogger] = None,
+    ) -> Tuple[List[str], Dict[str, List[str]], Dict[str, int]]:
+        """Convert .doc/.docx files to PDF, then merge converted PDFs."""
+        word_files = sorted(word_files)
+        conversion_summary = {
+            'attempted': len(word_files),
+            'converted': 0,
+            'failed': 0,
+        }
+
+        available, reason = self.word_converter_factory.is_available()
+        if not available:
+            raise RuntimeError(
+                "Word document processing requires Microsoft Word automation. "
+                f"Details: {reason}"
+            )
+
+        conversion_dir = _make_writable_temp_dir(prefix=f"word_pdf_{group_name}_")
+        converted_pdf_files: List[str] = []
+        source_file_map: Dict[str, str] = {}
+        bookmark_titles: Dict[str, str] = {}
+
+        try:
+            with self.word_converter_factory(warnings=warnings) as converter:
+                total_word_files = len(word_files)
+                for index, source_file in enumerate(word_files, 1):
+                    converted_pdf = os.path.join(conversion_dir, f"{uuid.uuid4().hex}.pdf")
+                    converted = converter.convert_file(source_file, converted_pdf)
+                    if converted:
+                        conversion_summary['converted'] += 1
+                        converted_pdf_files.append(converted_pdf)
+                        source_file_map[converted_pdf] = source_file
+                        bookmark_titles[converted_pdf] = os.path.basename(source_file)
+                    else:
+                        conversion_summary['failed'] += 1
+
+                    if (index % max(1, progress_interval) == 0) or index == total_word_files:
+                        message = (
+                            f"Word conversion progress for {group_name}: "
+                            f"{index}/{total_word_files} "
+                            f"(converted={conversion_summary['converted']}, failed={conversion_summary['failed']})"
+                        )
+                        print(f"    {message}")
+                        if run_logger:
+                            run_logger.log(
+                                "info",
+                                "word_conversion_progress",
+                                message,
+                                group=group_name,
+                                converted=conversion_summary['converted'],
+                                failed=conversion_summary['failed'],
+                                processed=index,
+                                total=total_word_files,
+                            )
+                        if progress_callback:
+                            progress_callback(message)
+
+            if not converted_pdf_files:
+                _record_warning(
+                    warnings,
+                    'word_conversion_no_outputs',
+                    'No Word documents could be converted to PDF in this group',
+                    group=group_name,
+                    attempted=len(word_files),
+                )
+                return [], {}, conversion_summary
+
+            required_outputs = self.pdf_merger.estimate_batch_count(converted_pdf_files)
+            self._ensure_output_capacity(
+                required_outputs,
+                current_output_count,
+                f"group '{group_name}' Word document files",
+            )
+
+            output_to_sources: Dict[str, List[str]] = {}
+            doc_outputs = self.pdf_merger.merge_pdfs(
+                converted_pdf_files,
+                output_path,
+                group_name,
+                warnings=warnings,
+                output_label="documents",
+                bookmark_titles=bookmark_titles,
+                source_file_map=source_file_map,
+                output_to_sources=output_to_sources,
+            )
+            summary_message = (
+                f"Word conversion summary for {group_name}: "
+                f"attempted={conversion_summary['attempted']}, "
+                f"converted={conversion_summary['converted']}, "
+                f"failed={conversion_summary['failed']}"
+            )
+            print(f"    {summary_message}")
+            if run_logger:
+                run_logger.log("info", "word_conversion_summary", summary_message, group=group_name)
+            if progress_callback:
+                progress_callback(summary_message)
+            return doc_outputs, output_to_sources, conversion_summary
+        finally:
+            shutil.rmtree(conversion_dir, ignore_errors=True)
 
     def _ensure_output_capacity(
         self,

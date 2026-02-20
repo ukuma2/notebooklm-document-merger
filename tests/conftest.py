@@ -1,8 +1,29 @@
 from pathlib import Path
+import shutil
+import os
+import uuid
 
 import pytest
 from docx import Document
 from pypdf import PdfWriter
+
+
+@pytest.fixture
+def tmp_path():
+    """
+    Local override for pytest's tmp_path fixture.
+    Some Windows environments create tmp roots with restrictive ACLs that
+    break test setup/teardown. This keeps temp dirs under LOCALAPPDATA/Temp.
+    """
+    base_root = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd())))
+    base = base_root / "Temp" / "codex_pytest_cases"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / f"case_{uuid.uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=False)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture
@@ -57,3 +78,44 @@ def make_eml(tmp_path: Path):
         return path
 
     return _make
+
+
+@pytest.fixture
+def patch_word_converter(monkeypatch):
+    def _patch(fail_contains: str = ""):
+        class FakeWordConverter:
+            def __init__(self, warnings=None):
+                self.warnings = warnings
+
+            @staticmethod
+            def is_available():
+                return True, ""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def convert_file(self, source_path: str, output_pdf_path: str) -> bool:
+                if fail_contains and fail_contains in source_path:
+                    if self.warnings is not None:
+                        self.warnings.append(
+                            {
+                                "code": "word_to_pdf_failed",
+                                "message": "Word-to-PDF conversion failed; skipping file",
+                                "file": source_path,
+                                "error": "mock_failure",
+                            }
+                        )
+                    return False
+
+                writer = PdfWriter()
+                writer.add_blank_page(width=72, height=72)
+                with open(output_pdf_path, "wb") as handle:
+                    writer.write(handle)
+                return True
+
+        monkeypatch.setattr("merger_engine.WordToPdfConverter", FakeWordConverter)
+
+    return _patch

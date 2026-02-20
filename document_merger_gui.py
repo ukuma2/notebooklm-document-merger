@@ -23,7 +23,8 @@ class DocumentMergerGUI:
         # Variables
         self.input_folder = tk.StringVar()
         self.output_folder = tk.StringVar()
-        self.max_file_size = tk.IntVar(value=800)
+        # Default batch target: 100 MB (in KB)
+        self.max_file_size = tk.IntVar(value=102400)
         self.max_output_files = tk.IntVar(value=300)
         
         self.process_pdfs = tk.BooleanVar(value=True)
@@ -56,8 +57,8 @@ class DocumentMergerGUI:
         content_frame = tk.Frame(self.root, padx=20, pady=20)
         content_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Input folder selection
-        tk.Label(content_frame, text="Input Folder:", font=('Arial', 10, 'bold')).grid(
+        # Input folder/zip selection
+        tk.Label(content_frame, text="Input Folder or ZIP:", font=('Arial', 10, 'bold')).grid(
             row=0, column=0, sticky='w', pady=(0, 5)
         )
         
@@ -67,7 +68,10 @@ class DocumentMergerGUI:
         tk.Entry(input_frame, textvariable=self.input_folder, width=50, state='readonly').pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10)
         )
-        tk.Button(input_frame, text="Browse...", command=self.browse_input, width=10).pack(side=tk.RIGHT)
+        input_buttons = tk.Frame(input_frame)
+        input_buttons.pack(side=tk.RIGHT)
+        tk.Button(input_buttons, text="ZIP...", command=self.browse_input_zip, width=8).pack(side=tk.RIGHT)
+        tk.Button(input_buttons, text="Folder...", command=self.browse_input, width=8).pack(side=tk.RIGHT, padx=(0, 6))
         
         # Output folder selection
         tk.Label(content_frame, text="Output Folder:", font=('Arial', 10, 'bold')).grid(
@@ -101,7 +105,7 @@ class DocumentMergerGUI:
         settings_frame.grid(row=5, column=0, columnspan=2, sticky='ew', pady=(0, 15))
         
         tk.Label(settings_frame, text="Max File Size (KB):").grid(row=0, column=0, sticky='w', padx=(0, 10))
-        tk.Spinbox(settings_frame, from_=100, to=5000, textvariable=self.max_file_size, width=10).grid(
+        tk.Spinbox(settings_frame, from_=1, to=99999999, textvariable=self.max_file_size, width=10).grid(
             row=0, column=1, sticky='w'
         )
         
@@ -148,11 +152,27 @@ class DocumentMergerGUI:
         """Open folder browser for input directory"""
         folder = filedialog.askdirectory(title="Select Input Folder")
         if folder:
-            self.input_folder.set(folder)
-            # Auto-suggest output folder
-            if not self.output_folder.get():
-                suggested_output = os.path.join(folder, "merged_output")
-                self.output_folder.set(suggested_output)
+            self._set_input_path(folder)
+
+    def browse_input_zip(self):
+        """Open file browser for ZIP input."""
+        zip_file = filedialog.askopenfilename(
+            title="Select ZIP File",
+            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
+        )
+        if zip_file:
+            self._set_input_path(zip_file)
+
+    def _set_input_path(self, path):
+        self.input_folder.set(path)
+        # Auto-suggest output folder
+        if not self.output_folder.get():
+            if os.path.isfile(path) and path.lower().endswith('.zip'):
+                zip_name = Path(path).stem
+                suggested_output = os.path.join(os.path.dirname(path), f"{zip_name}_merged_output")
+            else:
+                suggested_output = os.path.join(path, "merged_output")
+            self.output_folder.set(suggested_output)
     
     def browse_output(self):
         """Open folder browser for output directory"""
@@ -164,7 +184,7 @@ class DocumentMergerGUI:
         """Start the merging process"""
         # Validation
         if not self.input_folder.get():
-            messagebox.showerror("Error", "Please select an input folder")
+            messagebox.showerror("Error", "Please select an input folder or ZIP file")
             return
         
         if not self.output_folder.get():
@@ -175,8 +195,15 @@ class DocumentMergerGUI:
             messagebox.showerror("Error", "Please select at least one file type to process")
             return
         
-        if not os.path.exists(self.input_folder.get()):
-            messagebox.showerror("Error", "Input folder does not exist")
+        input_path = self.input_folder.get()
+        if not os.path.exists(input_path):
+            messagebox.showerror("Error", "Input path does not exist")
+            return
+
+        is_folder = os.path.isdir(input_path)
+        is_zip_file = os.path.isfile(input_path) and input_path.lower().endswith('.zip')
+        if not (is_folder or is_zip_file):
+            messagebox.showerror("Error", "Input must be a folder or a .zip file")
             return
         
         # Start processing in a separate thread
@@ -220,18 +247,35 @@ class DocumentMergerGUI:
         self.start_button.config(state='normal', text='🚀 Start Merging')
         self.status_label.config(text="Status: Complete! ✓", fg='#28a745')
         
+        summary = result.get("summary", {})
+        paths = result.get("paths", {})
+        logs = result.get("logs", {})
+
+        input_total = summary.get("input_files_total", result.get("total_input_files", 0))
+        processed_total = summary.get("processed_outputs_total", result.get("total_output_files", 0))
+        moved_total = summary.get("moved_unprocessed_total", 0)
+        failed_total = summary.get("failed_files_total", 0)
+        skipped_total = summary.get("skipped_files_total", 0)
+
         # Update statistics
-        self.files_found_label.config(text=f"Files Found: {result['total_input_files']}")
-        self.files_processed_label.config(text=f"Files Processed: {result['total_input_files']}")
-        self.output_files_label.config(text=f"Output Files: {result['total_output_files']}")
+        self.files_found_label.config(text=f"Files Found: {input_total}")
+        self.files_processed_label.config(text=f"Files Processed: {input_total}")
+        self.output_files_label.config(text=f"Output Files: {processed_total}")
         
         # Show success message
         messagebox.showinfo(
             "Success",
             f"Merge complete!\n\n"
-            f"Input files: {result['total_input_files']}\n"
-            f"Output files: {result['total_output_files']}\n\n"
-            f"Output saved to:\n{self.output_folder.get()}"
+            f"Input files: {input_total}\n"
+            f"Processed outputs: {processed_total}\n"
+            f"Moved (unprocessed): {moved_total}\n"
+            f"Failed files: {failed_total}\n"
+            f"Skipped files: {skipped_total}\n\n"
+            f"Processed folder:\n{paths.get('processed_dir', self.output_folder.get())}\n\n"
+            f"Unprocessed folder:\n{paths.get('unprocessed_dir', self.output_folder.get())}\n\n"
+            f"Failed folder:\n{paths.get('failed_dir', self.output_folder.get())}\n\n"
+            f"Manifest:\n{os.path.join(paths.get('processed_dir', self.output_folder.get()), 'merge_manifest.json')}\n\n"
+            f"Run log:\n{logs.get('text_log', 'N/A')}"
         )
         
         # Ask if user wants to open output folder
