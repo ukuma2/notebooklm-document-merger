@@ -27,7 +27,15 @@ def test_email_only_creates_output_directory_and_manifest(tmp_path):
     assert result["total_input_files"] == 1
     assert result["total_output_files"] == 1
     assert output_dir.exists()
-    assert (output_dir / "merge_manifest.json").exists()
+    assert (output_dir / "processed").exists()
+    assert (output_dir / "unprocessed").exists()
+    assert (output_dir / "failed").exists()
+    assert (output_dir / "logs").exists()
+    assert (output_dir / "processed" / "merge_manifest.json").exists()
+    assert "paths" in result
+    assert "logs" in result
+    assert result["paths"]["processed_dir"].endswith("processed")
+    assert result["paths"]["unprocessed_dir"].endswith("unprocessed")
     assert "limits" in result
     assert result["limits"]["max_output_files"] == 300
 

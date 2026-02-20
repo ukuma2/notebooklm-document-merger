@@ -139,3 +139,33 @@ def test_word_batch_size_splitting_honors_user_value(
 
     assert result["total_output_files"] == 3
     assert all(Path(path).name.startswith("root_documents_batch") for path in result["output_files"])
+
+
+def test_word_progress_logging_emits_interval_updates(
+    tmp_path,
+    make_docx,
+    patch_word_converter,
+    capsys,
+):
+    patch_word_converter()
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+
+    files = [make_docx(f"{idx}.docx", f"Doc {idx}") for idx in range(5)]
+    for file_path in files:
+        (input_dir / file_path.name).write_bytes(file_path.read_bytes())
+
+    orchestrator = MergeOrchestrator(
+        max_file_size_kb=1024,
+        process_pdfs=False,
+        process_docx=True,
+        process_emails=False,
+        word_progress_interval=2,
+    )
+    orchestrator.merge_documents(str(input_dir), str(tmp_path / "out"))
+
+    output = capsys.readouterr().out
+    assert "Word conversion progress for root: 2/5" in output
+    assert "Word conversion progress for root: 4/5" in output
+    assert "Word conversion progress for root: 5/5" in output
+    assert "Word conversion summary for root: attempted=5, converted=5, failed=0" in output
