@@ -1538,7 +1538,7 @@ class MergeOrchestrator:
             for temp_dir in zip_temp_dirs:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-            if not failed_files or not skipped_files:
+            if not failed_files and not skipped_files:
                 collected_failed, collected_skipped = self._collect_file_outcomes_from_warnings(warnings)
                 if not failed_files:
                     failed_files = collected_failed
