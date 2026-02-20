@@ -182,15 +182,30 @@ class WordToPdfConverter:
     def __enter__(self):
         pythoncom.CoInitialize()
         self.com_initialized = True
-        self.word_app = win32_client.DispatchEx("Word.Application")
-        self.word_app.Visible = False
-        self.word_app.DisplayAlerts = 0
         try:
-            # 3 == msoAutomationSecurityForceDisable
-            self.word_app.AutomationSecurity = 3
+            self.word_app = win32_client.DispatchEx("Word.Application")
+            self.word_app.Visible = False
+            self.word_app.DisplayAlerts = 0
+            try:
+                # 3 == msoAutomationSecurityForceDisable
+                self.word_app.AutomationSecurity = 3
+            except Exception:
+                # If setting AutomationSecurity fails, continue with defaults.
+                pass
+            return self
         except Exception:
-            pass
-        return self
+            # Ensure COM is uninitialized if initialization fails after CoInitialize.
+            if self.word_app is not None:
+                try:
+                    self.word_app.Quit()
+                except Exception:
+                    pass
+                finally:
+                    self.word_app = None
+            if self.com_initialized:
+                pythoncom.CoUninitialize()
+                self.com_initialized = False
+            raise
 
     def __exit__(self, exc_type, exc, tb):
         if self.word_app is not None:
