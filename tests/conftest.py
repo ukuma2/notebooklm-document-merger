@@ -1,6 +1,7 @@
 from pathlib import Path
 import shutil
 import os
+import tempfile
 import uuid
 
 import pytest
@@ -15,7 +16,7 @@ def tmp_path():
     Some Windows environments create tmp roots with restrictive ACLs that
     break test setup/teardown. This keeps temp dirs under LOCALAPPDATA/Temp.
     """
-    base_root = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd())))
+    base_root = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()))
     base = base_root / "Temp" / "codex_pytest_cases"
     base.mkdir(parents=True, exist_ok=True)
     path = base / f"case_{uuid.uuid4().hex}"
