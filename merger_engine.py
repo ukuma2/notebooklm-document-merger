@@ -1030,13 +1030,13 @@ class EmailExtractor:
             }
         except Exception as e:
             print(f"Error extracting .msg file {file_path}: {e}")
+            return None
         finally:
             if msg is not None:
                 try:
                     msg.close()
                 except Exception:
                     pass
-            return None
     
     @staticmethod
     def extract_eml(file_path: str) -> Optional[Dict]:
