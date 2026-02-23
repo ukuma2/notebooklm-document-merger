@@ -1,20 +1,20 @@
-# NotebookLM Document Merger
+﻿# NotebookLM Document Merger
 
-🚀 **A user-friendly tool to merge large document collections into NotebookLM-compatible batches**
+ðŸš€ **A user-friendly tool to merge large document collections into NotebookLM-compatible batches**
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-## ✨ Features
+## âœ¨ Features
 
 ### Smart Format Preservation
-- **📄 PDFs** → Merged natively (preserves scanned images, no OCR needed!)
-- **📝 Word (.doc/.docx)** → Converted with Microsoft Word to PDF, then merged as PDF batches
-- **📧 Emails** → Intelligently threaded by conversation
+- **ðŸ“„ PDFs** â†’ Merged natively (preserves scanned images, no OCR needed!)
+- **ðŸ“ Word (.doc/.docx)** â†’ Converted with Microsoft Word to PDF, then merged as PDF batches
+- **ðŸ“§ Emails** â†’ Subject-threaded and written into size-batched text outputs (default 25 MB)
 
 ### User-Friendly GUI
 - Drag & drop folder selection
-- Real-time progress tracking
+- Real-time progress tracking with live stage/event log
 - Works with any folder structure
 - Configurable size limits
 
@@ -25,7 +25,7 @@
 
 ---
 
-## 📥 Installation
+## ðŸ“¥ Installation
 
 ### Prerequisites
 - Python 3.8 or higher
@@ -51,7 +51,7 @@
 
 ---
 
-## 🎮 Usage
+## ðŸŽ® Usage
 
 ### GUI Mode (Recommended)
 
@@ -69,7 +69,7 @@
    - Adjust max file size and output limits
 
 4. **Start merging**:
-   - Click "🚀 Start Merging"
+   - Click "ðŸš€ Start Merging"
    - Monitor progress
    - Upload merged files to NotebookLM!
 
@@ -80,40 +80,40 @@
 
 ```
 Input/
-├── Case1/
-│   ├── contract.pdf
-│   ├── email1.msg
-│   └── report.docx
-└── Case2/
-    └── documents/
+â”œâ”€â”€ Case1/
+â”‚   â”œâ”€â”€ contract.pdf
+â”‚   â”œâ”€â”€ email1.msg
+â”‚   â””â”€â”€ report.docx
+â””â”€â”€ Case2/
+    â””â”€â”€ documents/
 
 Output/
-├── Case1_pdfs_batch1.pdf
-├── Case1_documents_batch1.pdf
-├── Case1_emails_thread1.txt
-└── merge_manifest.json
+â”œâ”€â”€ Case1_pdfs_batch1.pdf
+â”œâ”€â”€ Case1_documents_batch1.pdf
+â”œâ”€â”€ Case1_emails_batch1.txt
+â””â”€â”€ merge_manifest.json
 ```
 
 Output folders are always structured as:
 - `processed/` (merged outputs + `merge_manifest.json`)
-- `unprocessed/` (moved unsupported ZIP-extracted files)
-- `failed/` (file-level failure artifacts/metadata)
+- `unprocessed/` (relocated unsupported files from ZIP + normal input)
+- `failed/` (copied failed file artifacts + metadata)
 - `logs/` (run text + JSONL logs)
 
 ---
 
-## 🔧 How It Works
+## ðŸ”§ How It Works
 
 ### Intelligent Merging Strategy
 
 1. **Folder Analysis**: Auto-detects folder structure and grouping
 2. **ZIP Preprocessing**: Auto-extracts `.zip` archives with long-filename truncation for Windows compatibility
-3. **File Categorization**: Separates PDFs, Word documents, and emails
+3. **File Categorization**: Separates processable and unsupported files
 4. **Smart Batching**: Monitors file sizes and creates batches under limits
 5. **Format Preservation**: 
    - PDFs merged using pypdf (preserves everything including scanned images)
    - Word files are converted with Microsoft Word to PDF, then merged via the PDF pipeline
-   - Emails threaded by conversation and extracted to text
+   - Emails are grouped by subject thread, then packed into size-capped batch files with attachment indexes
 
 ### Email Threading
 
@@ -129,43 +129,55 @@ Emails are intelligently grouped:
 - Entry names are truncated to 50 characters by default (including extension)
 - Nested ZIP archives are extracted one level deep
 - ZIP contents are grouped under a synthetic group name based on the ZIP filename (for example: `root_Emails-49431`)
+- Unsupported files are relocated under `unprocessed/zip/<group>/...`
+- Unsupported normal input files are relocated under `unprocessed/input/...`
 
 ---
 
-## 📁 Project Structure
+## ðŸ“ Project Structure
 
 ```
 notebooklm-document-merger/
-├── document_merger_gui.py    # GUI application
-├── merger_engine.py           # Core merging logic
-├── requirements.txt           # Python dependencies
-├── README.md                  # This file
-└── .gitignore                 # Git ignore rules
+â”œâ”€â”€ document_merger_gui.py    # GUI application
+â”œâ”€â”€ merger_engine.py           # Core merging logic
+â”œâ”€â”€ requirements.txt           # Python dependencies
+â”œâ”€â”€ README.md                  # This file
+â””â”€â”€ .gitignore                 # Git ignore rules
 ```
 
 ---
 
-## 🛠️ Advanced Options
+## ðŸ› ï¸ Advanced Options
 
 ### Creating Standalone Executable
 
 To create a `.exe` file that doesn't require Python:
 
-1. Install PyInstaller:
-   ```bash
-   pip install pyinstaller
-   ```
+**Option 1: One-Click Build (Easiest)**
+```bash
+build.bat
+```
+Or:
+```bash
+python build_exe.py
+```
 
-2. Build executable:
-   ```bash
-   pyinstaller --name="NotebookLM_Merger" --onefile --windowed document_merger_gui.py
-   ```
+**Option 2: Manual Build**
+```bash
+pip install pyinstaller
+pyinstaller NotebookLM_Merger.spec
+```
 
-3. Find executable in `dist/` folder
+The executable will be created in `dist/NotebookLM_Merger.exe` — a single portable file (~80-120 MB) with no dependencies.
+
+**For Distribution:**
+- Simply copy `dist/NotebookLM_Merger.exe` to users
+- No Python installation needed on their machine
+- Requires Microsoft Word for `.doc`/`.docx` conversion
 
 ---
 
-## 🐛 Troubleshooting
+## ðŸ› Troubleshooting
 
 **Q: GUI won't start**
 - Ensure Python 3.8+ is installed: `python --version`
@@ -189,24 +201,29 @@ To create a `.exe` file that doesn't require Python:
 - Failed conversions are skipped and recorded as warnings in `processed/merge_manifest.json`
 
 **Q: Emoji characters not displaying properly**
-- The GUI uses Unicode emojis (📄, 📝, 📧, 🚀) which may not render on older systems
+- The GUI uses Unicode emojis (ðŸ“„, ðŸ“, ðŸ“§, ðŸš€) which may not render on older systems
 - On Windows 7/8 or minimal Linux systems, you may see boxes instead of emojis
 - This is a cosmetic issue and doesn't affect functionality
 
 ---
 
-## 📊 Technical Details
+## ðŸ“Š Technical Details
 
 ### Dependencies
-- **pypdf** (≥4.0.0): PDF merging
+- **pypdf** (â‰¥4.0.0): PDF merging
 - **pywin32** (Windows only): Microsoft Word automation for Word-to-PDF conversion
-- **extract-msg** (≥0.45.0): Outlook MSG parsing
-- **python-dateutil** (≥2.8.2): Date parsing
+- **extract-msg** (â‰¥0.45.0): Outlook MSG parsing
+- **python-dateutil** (â‰¥2.8.2): Date parsing
 
 ### ZIP Defaults
 - ZIP preprocessing is enabled by default
 - ZIP filename limit: 50 characters (including extension)
 - Nested ZIP extraction depth: 1 level
+
+### Email Output Defaults
+- Email output mode defaults to `size_batched`
+- Email batch size cap defaults to 25 MB per output file
+- Email outputs include body text and attachment metadata index (no binary attachment payload embedding)
 
 ### Real-Data ZIP Smoke Check
 Run this command to validate ZIP handling against your large archive outside CI:
@@ -223,7 +240,7 @@ python tests/smoke_zip_real_data.py --zip Emails-49431.zip --workdir ._tmp_zip_r
 
 ---
 
-## 🤝 Contributing
+## ðŸ¤ Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
@@ -234,25 +251,25 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [ ] Batch rename utility
 - [ ] Undo/rollback functionality
 
-### 🤖 Automated Workflows
+### ðŸ¤– Automated Workflows
 
 This repository uses GitHub Actions to automate pull request validation and merging. Here's what happens automatically:
 
 #### PR Validation
 When you submit a pull request:
-- **✅ Automated Testing & Linting**: Code is automatically checked with flake8 and pylint
-- **🔍 Conflict Detection**: Checks for merge conflicts with the base branch
-- **🏷️ Auto-Labeling**: PRs are automatically labeled based on:
+- **âœ… Automated Testing & Linting**: Code is automatically checked with flake8 and pylint
+- **ðŸ” Conflict Detection**: Checks for merge conflicts with the base branch
+- **ðŸ·ï¸ Auto-Labeling**: PRs are automatically labeled based on:
   - File types changed (python, documentation, dependencies, github-actions)
   - PR size (small <50 lines, medium <200 lines, large 200+ lines)
   - Source (external-contribution for forks)
 
 #### Auto-Merge System
 PRs can be automatically merged when ALL of these conditions are met:
-- ✅ All required checks pass (linting, tests)
-- ✅ No merge conflicts with base branch
-- ✅ Approved by at least one reviewer **OR** has the `auto-merge` label
-- ✅ Branch is up to date
+- âœ… All required checks pass (linting, tests)
+- âœ… No merge conflicts with base branch
+- âœ… Approved by at least one reviewer **OR** has the `auto-merge` label
+- âœ… Branch is up to date
 
 **To enable auto-merge on your PR:**
 1. Wait for a project maintainer to review and approve your PR, OR
@@ -263,7 +280,7 @@ PRs can be automatically merged when ALL of these conditions are met:
 - Auto-merge requires approval from a maintainer
 - Your code is automatically checked without requiring manual intervention
 
-#### 🔒 Security Features
+#### ðŸ”’ Security Features
 
 **For Fork Contributors:**
 - All workflows run safely without access to repository secrets
@@ -271,9 +288,9 @@ PRs can be automatically merged when ALL of these conditions are met:
 - Auto-merge requires maintainer approval for all external PRs
 
 **Dependabot Auto-Merge Policy:**
-- ✅ **Patch updates** (1.2.3 → 1.2.4): Auto-merged after checks pass
-- ⚠️ **Minor updates** (1.2.0 → 1.3.0): Requires manual review
-- 🚨 **Major updates** (1.0.0 → 2.0.0): Requires manual review
+- âœ… **Patch updates** (1.2.3 â†’ 1.2.4): Auto-merged after checks pass
+- âš ï¸ **Minor updates** (1.2.0 â†’ 1.3.0): Requires manual review
+- ðŸš¨ **Major updates** (1.0.0 â†’ 2.0.0): Requires manual review
 
 **Security Scanning:**
 - CodeQL analysis runs on all PRs and weekly
@@ -306,7 +323,7 @@ For repository maintainers, recommended branch protection rules for `main`:
 
 ---
 
-## 📝 License
+## ðŸ“ License
 
 This project is licensed under the MIT License - see below for details.
 
@@ -336,16 +353,19 @@ SOFTWARE.
 
 ---
 
-## 🌟 Acknowledgments
+## ðŸŒŸ Acknowledgments
 
 Built for use with [Google NotebookLM](https://notebooklm.google.com/)
 
 ---
 
-## 📧 Support
+## ðŸ“§ Support
 
 For issues or questions, please [open an issue](https://github.com/YOUR_USERNAME/notebooklm-document-merger/issues) on GitHub.
+Implementation and operational handover details are in [docs/IMPLEMENTATION_HANDOVER.md](docs/IMPLEMENTATION_HANDOVER.md).
 
 ---
 
-**Made with ❤️ for NotebookLM users**
+**Made with â¤ï¸ for NotebookLM users**
+
+

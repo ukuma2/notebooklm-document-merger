@@ -3,18 +3,35 @@ Document Merger Engine - Core merging logic
 Handles PDF, DOCX, and Email merging with flexible folder structure support
 """
 
+import atexit
 import os
 import json
 from copy import deepcopy
 from datetime import datetime, timezone
 import shutil
 import tempfile
+import threading
 import uuid
 import zipfile
 import traceback
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Tuple, Set, Any, Callable
 from collections import defaultdict
 import re
+
+# Module-level tracking of temp dirs for atexit cleanup if process is killed.
+_active_temp_dirs: Set[str] = set()
+_active_temp_dirs_lock = threading.Lock()
+
+
+def _atexit_cleanup_temp_dirs():
+    """Last-resort cleanup of temp dirs when the process exits."""
+    with _active_temp_dirs_lock:
+        for d in list(_active_temp_dirs):
+            shutil.rmtree(d, ignore_errors=True)
+        _active_temp_dirs.clear()
+
+
+atexit.register(_atexit_cleanup_temp_dirs)
 
 # PDF handling
 try:
@@ -57,7 +74,13 @@ except ImportError:
 
 from email import policy
 from email.parser import BytesParser
-from dateutil import parser as date_parser
+
+try:
+    from dateutil import parser as date_parser
+    HAS_DATEUTIL = True
+except ImportError:
+    date_parser = None  # type: ignore[assignment]
+    HAS_DATEUTIL = False
 
 
 def _record_warning(warnings: Optional[List[Dict]], code: str, message: str, **context) -> None:
@@ -67,6 +90,16 @@ def _record_warning(warnings: Optional[List[Dict]], code: str, message: str, **c
     warning = {'code': code, 'message': message}
     warning.update(context)
     warnings.append(warning)
+
+
+def _safe_progress(callback, *args) -> None:
+    """Call a progress callback, swallowing exceptions to avoid crashing the merge."""
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:
+        pass
 
 
 def _make_writable_temp_dir(prefix: str) -> str:
@@ -103,11 +136,19 @@ def _make_writable_temp_dir(prefix: str) -> str:
 class RunLogger:
     """Persist run events to text and JSONL logs."""
 
-    def __init__(self, logs_dir: str, run_id: str, enabled: bool = True, privacy_mode: str = "redacted"):
+    def __init__(
+        self,
+        logs_dir: str,
+        run_id: str,
+        enabled: bool = True,
+        privacy_mode: str = "redacted",
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ):
         self.enabled = enabled
         self.privacy_mode = privacy_mode
         self.run_id = run_id
         self.logs_dir = logs_dir
+        self.event_callback = event_callback
         self.text_log_path = os.path.join(logs_dir, f"run_{run_id}.log")
         self.jsonl_log_path = os.path.join(logs_dir, f"run_{run_id}.jsonl")
         self._text_handle = None
@@ -161,15 +202,21 @@ class RunLogger:
             text_context = " | " + ", ".join(context_parts)
         self._text_handle.write(f"[{timestamp}] {level.upper()} {event}: {message}{text_context}\n")
         self._text_handle.flush()
+        if self.event_callback:
+            try:
+                self.event_callback(payload)
+            except Exception:
+                pass
 
 
 class WordToPdfConverter:
     """Converts .doc/.docx files to PDF using Microsoft Word COM automation."""
 
-    def __init__(self, warnings: Optional[List[Dict]] = None):
+    def __init__(self, warnings: Optional[List[Dict]] = None, timeout_seconds: int = 120):
         self.warnings = warnings
         self.word_app = None
         self.com_initialized = False
+        self.timeout_seconds = timeout_seconds
 
     @staticmethod
     def is_available() -> Tuple[bool, str]:
@@ -225,10 +272,24 @@ class WordToPdfConverter:
             raise RuntimeError("Word automation session is not initialized.")
 
         document = None
+        timed_out = threading.Event()
+
+        def _timeout_killer():
+            """Force-close the document if conversion exceeds timeout."""
+            timed_out.set()
+            try:
+                if document is not None:
+                    document.Close(SaveChanges=False)
+            except Exception:
+                pass
+
+        timer = threading.Timer(self.timeout_seconds, _timeout_killer)
         try:
             os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
             input_abs = os.path.abspath(source_path)
             output_abs = os.path.abspath(output_pdf_path)
+
+            timer.start()
 
             document = self.word_app.Documents.Open(
                 input_abs,
@@ -238,6 +299,9 @@ class WordToPdfConverter:
                 ConfirmConversions=False,
             )
 
+            if timed_out.is_set():
+                raise TimeoutError(f"Word conversion timed out after {self.timeout_seconds}s")
+
             # wdExportFormatPDF = 17
             if hasattr(document, "ExportAsFixedFormat"):
                 document.ExportAsFixedFormat(output_abs, 17)
@@ -245,7 +309,19 @@ class WordToPdfConverter:
                 # Fallback for older Office object models.
                 document.SaveAs(output_abs, FileFormat=17)
 
+            if timed_out.is_set():
+                raise TimeoutError(f"Word conversion timed out after {self.timeout_seconds}s")
+
             return os.path.exists(output_abs) and os.path.getsize(output_abs) > 0
+        except TimeoutError as exc:
+            _record_warning(
+                self.warnings,
+                'word_to_pdf_timeout',
+                f'Word conversion timed out after {self.timeout_seconds}s; skipping file',
+                file=source_path,
+                timeout=self.timeout_seconds,
+            )
+            return False
         except Exception as exc:
             _record_warning(
                 self.warnings,
@@ -256,6 +332,7 @@ class WordToPdfConverter:
             )
             return False
         finally:
+            timer.cancel()
             if document is not None:
                 try:
                     document.Close(SaveChanges=False)
@@ -518,6 +595,14 @@ class PDFMerger:
         for pdf_file in pdf_files:
             try:
                 reader = PdfReader(pdf_file)
+                if reader.is_encrypted:
+                    _record_warning(
+                        warnings,
+                        'pdf_encrypted',
+                        'PDF is password-protected and cannot be merged; skipping',
+                        file=pdf_file,
+                    )
+                    continue
                 page_start = total_pages_added
                 file_pages_added = 0
                 for page in reader.pages:
@@ -909,18 +994,48 @@ class EmailExtractor:
         if not HAS_EXTRACT_MSG:
             return None
             
+        msg = None
         try:
             msg = extract_msg.Message(file_path)
+            attachments = []
+            for attachment in getattr(msg, "attachments", []) or []:
+                filename = (
+                    getattr(attachment, "longFilename", None)
+                    or getattr(attachment, "shortFilename", None)
+                    or "unnamed_attachment"
+                )
+                content_type = getattr(attachment, "mimeType", None) or ""
+                size_bytes = None
+                data = getattr(attachment, "data", None)
+                if data is not None:
+                    try:
+                        size_bytes = len(data)
+                    except Exception:
+                        size_bytes = None
+                attachments.append(
+                    {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size_bytes": size_bytes,
+                    }
+                )
             return {
                 'subject': msg.subject or '(No Subject)',
                 'from': msg.sender or '',
                 'to': msg.to or '',
                 'cc': msg.cc or '',
                 'date': msg.date,
-                'body': msg.body or ''
+                'body': msg.body or '',
+                'attachments': attachments,
             }
         except Exception as e:
             print(f"Error extracting .msg file {file_path}: {e}")
+        finally:
+            if msg is not None:
+                try:
+                    msg.close()
+                except Exception:
+                    pass
             return None
     
     @staticmethod
@@ -929,14 +1044,34 @@ class EmailExtractor:
         try:
             with open(file_path, 'rb') as f:
                 msg = BytesParser(policy=policy.default).parse(f)
-            
+            attachments = []
+            for part in msg.walk():
+                if part.is_multipart():
+                    continue
+                disposition = part.get_content_disposition()
+                filename = part.get_filename()
+                if disposition not in ("attachment", "inline") and not filename:
+                    continue
+                payload = part.get_payload(decode=True)
+                size_bytes = len(payload) if payload is not None else None
+                attachments.append(
+                    {
+                        "filename": filename or "unnamed_attachment",
+                        "content_type": part.get_content_type() or "",
+                        "size_bytes": size_bytes,
+                    }
+                )
+            body_part = msg.get_body(preferencelist=('plain', 'html'))
+            body_text = body_part.get_content() if body_part else ''
+
             return {
                 'subject': msg.get('subject', '(No Subject)'),
                 'from': msg.get('from', ''),
                 'to': msg.get('to', ''),
                 'cc': msg.get('cc', ''),
                 'date': msg.get('date'),
-                'body': msg.get_body(preferencelist=('plain', 'html')).get_content() if msg.get_body() else ''
+                'body': body_text,
+                'attachments': attachments,
             }
         except Exception as e:
             print(f"Error extracting .eml file {file_path}: {e}")
@@ -963,6 +1098,11 @@ class EmailThreader:
         if isinstance(date_value, datetime):
             parsed = date_value
         elif isinstance(date_value, str) and date_value.strip():
+            if not HAS_DATEUTIL:
+                raise RuntimeError(
+                    "python-dateutil is required for email date parsing. "
+                    "Install it with: pip install python-dateutil"
+                )
             try:
                 parsed = date_parser.parse(date_value)
             except (ValueError, TypeError, OverflowError):
@@ -1149,6 +1289,7 @@ class ZipArchiveProcessor:
         depth: int,
         depth_limit: int,
         warnings: Optional[List[Dict]],
+        max_extract_bytes: int = 0,
     ) -> Dict:
         stats = {
             'archives_extracted': 0,
@@ -1164,12 +1305,41 @@ class ZipArchiveProcessor:
 
         used_paths: Set[str] = set()
         nested_archives: List[str] = []
+        total_extracted_bytes = 0
+        budget_exceeded = False
 
         try:
             with zipfile.ZipFile(zip_path, 'r') as zip_handle:
                 stats['archives_extracted'] += 1
 
                 for entry in zip_handle.infolist():
+                    # ZIP bomb protection: skip if budget exceeded
+                    if budget_exceeded:
+                        break
+                    if max_extract_bytes > 0 and entry.file_size > 0:
+                        ratio = entry.file_size / max(entry.compress_size, 1)
+                        if ratio > 100:
+                            _record_warning(
+                                warnings,
+                                'zip_entry_suspicious_ratio',
+                                'ZIP entry has suspicious compression ratio (possible zip bomb); skipping',
+                                archive=zip_path,
+                                entry=entry.filename,
+                                ratio=round(ratio, 1),
+                            )
+                            continue
+                        if total_extracted_bytes + entry.file_size > max_extract_bytes:
+                            _record_warning(
+                                warnings,
+                                'zip_extraction_budget_exceeded',
+                                'ZIP extraction stopped: total extracted size would exceed safety budget',
+                                archive=zip_path,
+                                budget_bytes=max_extract_bytes,
+                                extracted_so_far=total_extracted_bytes,
+                            )
+                            budget_exceeded = True
+                            break
+
                     safe_member = self._safe_member_path(entry.filename)
                     if safe_member is None:
                         if not entry.is_dir():
@@ -1217,6 +1387,7 @@ class ZipArchiveProcessor:
                             with open(target_path, 'wb') as target_handle:
                                 shutil.copyfileobj(source_handle, target_handle)
                         stats['entries_extracted'] += 1
+                        total_extracted_bytes += entry.file_size
                     except Exception as exc:
                         _record_warning(
                             warnings,
@@ -1256,6 +1427,7 @@ class ZipArchiveProcessor:
                         depth=depth + 1,
                         depth_limit=depth_limit,
                         warnings=warnings,
+                        max_extract_bytes=max_extract_bytes,
                     )
                     stats['archives_extracted'] += nested_stats['archives_extracted']
                     stats['archives_failed'] += nested_stats['archives_failed']
@@ -1263,7 +1435,7 @@ class ZipArchiveProcessor:
                     stats['entries_extracted'] += nested_stats['entries_extracted']
                     stats['entries_renamed'] += nested_stats['entries_renamed']
                     stats['entries_skipped_unsafe_path'] += nested_stats['entries_skipped_unsafe_path']
-                    stats['nested_archives_extracted'] += nested_stats['archives_extracted']
+                    stats['nested_archives_extracted'] += 1  # count this immediate nested archive
                     stats['nested_archives_extracted'] += nested_stats['nested_archives_extracted']
                     stats['nested_archives_skipped_depth'] += nested_stats['nested_archives_skipped_depth']
                     stats['extracted_files'].extend(nested_stats['extracted_files'])
@@ -1304,6 +1476,17 @@ class MergeOrchestrator:
         word_progress_interval=10,
         enable_detailed_logging=True,
         log_privacy_mode="redacted",
+        relocate_unsupported_input_files=True,
+        unsupported_input_action="copy",
+        failed_file_artifact_action="copy",
+        unprocessed_include_source_files=True,
+        failed_include_artifacts=True,
+        email_output_mode="size_batched",
+        email_max_output_file_mb=25,
+        email_include_attachment_index=True,
+        email_batch_name_prefix="emails_batch",
+        zip_max_extract_bytes=2 * 1024 ** 3,  # 2 GB default extraction budget
+        word_convert_timeout_seconds=120,
     ):
         self.max_file_size_kb = max_file_size_kb
         self.pdf_merger = PDFMerger(max_file_size_kb)
@@ -1328,16 +1511,35 @@ class MergeOrchestrator:
         self.word_progress_interval = max(1, int(word_progress_interval))
         self.enable_detailed_logging = enable_detailed_logging
         self.log_privacy_mode = log_privacy_mode
-        
-    def merge_documents(self, input_path: str, output_path: str, progress_callback=None) -> Dict:
+        self.relocate_unsupported_input_files = relocate_unsupported_input_files
+        self.unsupported_input_action = unsupported_input_action
+        self.failed_file_artifact_action = failed_file_artifact_action
+        self.unprocessed_include_source_files = unprocessed_include_source_files
+        self.failed_include_artifacts = failed_include_artifacts
+        self.email_output_mode = email_output_mode
+        self.email_max_output_file_mb = max(1, int(email_max_output_file_mb))
+        self.email_include_attachment_index = email_include_attachment_index
+        self.email_batch_name_prefix = email_batch_name_prefix
+        self.zip_max_extract_bytes = int(zip_max_extract_bytes)
+        self.word_convert_timeout_seconds = max(10, int(word_convert_timeout_seconds))
+
+    def merge_documents(
+        self,
+        input_path: str,
+        output_path: str,
+        progress_callback=None,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Dict:
         """
         Main entry point for document merging
-        
+
         Args:
             input_path: Input directory containing documents
             output_path: Output directory for merged files
             progress_callback: Optional callback function(current, total, message)
-            
+            cancel_event: Optional threading.Event; set to request graceful cancellation
+
         Returns:
             Dict with merge statistics
         """
@@ -1364,6 +1566,7 @@ class MergeOrchestrator:
             run_id=run_id,
             enabled=self.enable_detailed_logging,
             privacy_mode=self.log_privacy_mode,
+            event_callback=event_callback,
         )
 
         staged_input_root = None
@@ -1373,10 +1576,13 @@ class MergeOrchestrator:
         errors: List[Dict] = []
         output_to_sources: Dict[str, List[str]] = {}
         moved_unprocessed: List[Dict] = []
+        unprocessed_files: List[Dict] = []
         failed_files: List[Dict] = []
         skipped_files: List[Dict] = []
         fatal_exception = None
         fatal_error_message = ""
+        warning_cursor = 0
+        failed_artifacts_total = 0
 
         word_conversion_summary = {
             'attempted': 0,
@@ -1399,12 +1605,23 @@ class MergeOrchestrator:
         file_count = 0
         zip_temp_dirs: List[str] = []
         manifest: Dict = {}
+        email_summary = {
+            'parsed_total': 0,
+            'failed_total': 0,
+            'threads_total': 0,
+            'batches_total': 0,
+            'output_total_bytes': 0,
+            'attachment_refs_total': 0,
+            'batch_to_threads': {},
+        }
 
         try:
             if os.path.isfile(input_path):
                 if not input_path.lower().endswith('.zip'):
                     raise RuntimeError("Input path must be a folder or .zip file.")
                 staged_input_root = _make_writable_temp_dir(prefix="single_zip_input_")
+                with _active_temp_dirs_lock:
+                    _active_temp_dirs.add(staged_input_root)
                 staged_archive = os.path.join(staged_input_root, os.path.basename(input_path))
                 shutil.copy2(input_path, staged_archive)
                 working_input_path = staged_input_root
@@ -1421,6 +1638,7 @@ class MergeOrchestrator:
             groups = self.folder_analyzer.analyze_structure(working_input_path, exclude_paths=exclude_paths)
             print(f"Found {len(groups)} groups to process")
             run_logger.log("info", "groups_analyzed", "Folder analysis complete", group_count=len(groups))
+            warning_cursor = self._sync_warning_events(warnings, warning_cursor, run_logger)
 
             total_input_files = sum(len(files) for files in groups.values())
             if staged_input_root:
@@ -1432,8 +1650,12 @@ class MergeOrchestrator:
                 zip_processing_summary=zip_processing_summary,
             )
             zip_temp_dirs.extend(extracted_zip_temp_dirs)
+            warning_cursor = self._sync_warning_events(warnings, warning_cursor, run_logger)
 
             for group_name, files in sorted(groups.items()):
+                if cancel_event is not None and cancel_event.is_set():
+                    run_logger.log("warning", "run_cancelled", "Merge cancelled by user")
+                    break
                 if not files:
                     continue
 
@@ -1442,19 +1664,49 @@ class MergeOrchestrator:
                 group_files = sorted(files)
 
                 supported_files = [f for f in group_files if self._is_supported_processable_file(f)]
-                if group_name in zip_group_meta:
-                    unsupported_files = [f for f in group_files if f not in supported_files]
-                    if unsupported_files:
-                        self._move_unsupported_zip_files(
-                            unsupported_files=unsupported_files,
-                            group_name=group_name,
-                            extraction_root=zip_group_meta[group_name]["extraction_root"],
-                            unprocessed_root=unprocessed_dir,
-                            moved_unprocessed=moved_unprocessed,
+                unsupported_files = [f for f in group_files if f not in supported_files]
+                if unsupported_files and self.unprocessed_include_source_files:
+                    if group_name in zip_group_meta:
+                        relocated = self._relocate_unsupported_files(
+                            files_to_relocate=unsupported_files,
+                            target_root=unprocessed_dir,
+                            target_prefix="",
+                            base_path=zip_group_meta[group_name]["extraction_root"],
+                            action="move",
+                            reason="unsupported_zip_file_moved",
+                            origin="zip_extract",
+                            stage="classification",
                             warnings=warnings,
                             run_logger=run_logger,
+                            success_event="unsupported_zip_file_relocated",
+                            flatten=True,
                         )
-                    group_files = supported_files
+                        unprocessed_files.extend(relocated)
+                        moved_unprocessed.extend(
+                            {
+                                "source": item["source"],
+                                "destination": item["destination"],
+                                "reason": item["reason"],
+                            }
+                            for item in relocated
+                        )
+                    elif self.relocate_unsupported_input_files:
+                        relocated = self._relocate_unsupported_files(
+                            files_to_relocate=unsupported_files,
+                            target_root=unprocessed_dir,
+                            target_prefix="",
+                            base_path=working_input_path,
+                            action=self.unsupported_input_action,
+                            reason="unsupported_input_file_relocated",
+                            origin="input",
+                            stage="classification",
+                            warnings=warnings,
+                            run_logger=run_logger,
+                            success_event="unsupported_input_file_relocated",
+                            flatten=True,
+                        )
+                        unprocessed_files.extend(relocated)
+                group_files = supported_files
 
                 pdfs = [f for f in group_files if f.lower().endswith('.pdf')]
                 word_docs = [f for f in group_files if f.lower().endswith(('.docx', '.doc'))]
@@ -1477,14 +1729,14 @@ class MergeOrchestrator:
                     )
                     output_files.extend(pdf_outputs)
                     run_logger.log("info", "pdf_merge_end", "Completed PDF merge", group=group_name, outputs=len(pdf_outputs))
+                    warning_cursor = self._sync_warning_events(warnings, warning_cursor, run_logger)
 
                 if word_docs and self.process_docx:
                     print(f"  Processing {len(word_docs)} Word document files...")
                     run_logger.log("info", "word_convert_start", "Starting Word conversion", group=group_name, count=len(word_docs))
 
                     def word_progress_update(message: str) -> None:
-                        if progress_callback:
-                            progress_callback(file_count, total_input_files, message)
+                        _safe_progress(progress_callback, file_count, total_input_files, message)
 
                     doc_outputs, doc_output_to_sources, conversion_summary = self._process_word_documents(
                         word_docs,
@@ -1502,26 +1754,51 @@ class MergeOrchestrator:
                     word_conversion_summary['converted'] += conversion_summary['converted']
                     word_conversion_summary['failed'] += conversion_summary['failed']
                     run_logger.log("info", "word_convert_end", "Completed Word conversion", group=group_name, outputs=len(doc_outputs))
+                    warning_cursor = self._sync_warning_events(warnings, warning_cursor, run_logger)
 
                 if emails and self.process_emails:
                     print(f"  Processing {len(emails)} email files...")
                     run_logger.log("info", "email_thread_start", "Starting email threading", group=group_name, count=len(emails))
-                    email_threads = self._prepare_email_threads(emails, warnings=warnings)
-                    self._ensure_output_capacity(
-                        len(email_threads),
-                        len(output_files),
-                        f"group '{group_name}' email threads",
+                    email_threads, email_extract_stats = self._prepare_email_threads(
+                        emails,
+                        warnings=warnings,
                     )
-                    email_outputs = self._write_email_threads(email_threads, processed_dir, group_name)
+                    email_summary['parsed_total'] += email_extract_stats.get('parsed_total', 0)
+                    email_summary['failed_total'] += email_extract_stats.get('failed_total', 0)
+                    email_summary['attachment_refs_total'] += email_extract_stats.get('attachment_refs_total', 0)
+                    warning_cursor = self._sync_warning_events(warnings, warning_cursor, run_logger)
+                    email_outputs, email_batch_stats = self._write_email_outputs(
+                        threads=email_threads,
+                        output_path=processed_dir,
+                        group_name=group_name,
+                        current_output_count=len(output_files),
+                        warnings=warnings,
+                        run_logger=run_logger,
+                    )
                     output_files.extend(email_outputs)
+                    email_summary['threads_total'] += email_batch_stats.get('threads_total', 0)
+                    email_summary['batches_total'] += email_batch_stats.get('batches_total', 0)
+                    email_summary['output_total_bytes'] += email_batch_stats.get('output_total_bytes', 0)
+                    email_summary['batch_to_threads'].update(email_batch_stats.get('batch_to_threads', {}))
                     run_logger.log("info", "email_thread_end", "Completed email threading", group=group_name, outputs=len(email_outputs))
+                    warning_cursor = self._sync_warning_events(warnings, warning_cursor, run_logger)
 
                 file_count += group_file_weights.get(group_name, 0)
-                if progress_callback:
-                    progress_callback(file_count, total_input_files, f"Processed {group_name}")
+                _safe_progress(progress_callback, file_count, total_input_files, f"Processed {group_name}")
                 run_logger.log("info", "group_end", "Finished group", group=group_name, processed=file_count, total=total_input_files)
+                warning_cursor = self._sync_warning_events(warnings, warning_cursor, run_logger)
 
             failed_files, skipped_files = self._collect_file_outcomes_from_warnings(warnings)
+            failed_artifacts_total = self._materialize_failed_artifacts(
+                failed_files=failed_files,
+                failed_root=failed_dir,
+                input_root=working_input_path,
+                action=self.failed_file_artifact_action,
+                include_artifacts=self.failed_include_artifacts,
+                warnings=warnings,
+                run_logger=run_logger,
+            )
+            warning_cursor = self._sync_warning_events(warnings, warning_cursor, run_logger)
         except Exception as exc:
             fatal_exception = exc
             fatal_error_message = str(exc)
@@ -1535,15 +1812,23 @@ class MergeOrchestrator:
             )
             run_logger.log("error", "fatal_error", "Fatal processing error", error=str(exc))
         finally:
-            for temp_dir in zip_temp_dirs:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
             if not failed_files and not skipped_files:
                 collected_failed, collected_skipped = self._collect_file_outcomes_from_warnings(warnings)
                 if not failed_files:
                     failed_files = collected_failed
                 if not skipped_files:
                     skipped_files = collected_skipped
+            if failed_files and failed_artifacts_total == 0:
+                failed_artifacts_total = self._materialize_failed_artifacts(
+                    failed_files=failed_files,
+                    failed_root=failed_dir,
+                    input_root=working_input_path,
+                    action=self.failed_file_artifact_action,
+                    include_artifacts=self.failed_include_artifacts,
+                    warnings=warnings,
+                    run_logger=run_logger,
+                )
+                warning_cursor = self._sync_warning_events(warnings, warning_cursor, run_logger)
 
             manifest_path = os.path.join(processed_dir, 'merge_manifest.json')
             manifest = {
@@ -1571,7 +1856,9 @@ class MergeOrchestrator:
                     'input_files_total': total_input_files,
                     'processed_outputs_total': len(output_files),
                     'moved_unprocessed_total': len(moved_unprocessed),
+                    'unprocessed_relocated_total': len(unprocessed_files),
                     'failed_files_total': len(failed_files),
+                    'failed_artifacts_total': failed_artifacts_total,
                     'skipped_files_total': len(skipped_files),
                     'warnings_total': len(warnings),
                     'errors_total': len(errors),
@@ -1579,6 +1866,7 @@ class MergeOrchestrator:
                 'files': {
                     'processed_outputs': output_files,
                     'moved_unprocessed': moved_unprocessed,
+                    'unprocessed': unprocessed_files,
                     'failed': failed_files,
                     'skipped': skipped_files,
                 },
@@ -1594,13 +1882,29 @@ class MergeOrchestrator:
                 manifest['word_conversion'] = word_conversion_summary
             if zip_processing_summary['archives_found'] > 0:
                 manifest['zip_processing'] = zip_processing_summary
+            if email_summary['parsed_total'] > 0 or email_summary['failed_total'] > 0:
+                manifest['emails'] = email_summary
 
             try:
                 with open(manifest_path, 'w', encoding='utf-8') as f:
                     json.dump(manifest, f, indent=2)
                 run_logger.log("info", "manifest_written", "Wrote merge manifest", path=manifest_path)
+            except Exception as manifest_exc:
+                run_logger.log(
+                    "warning",
+                    "manifest_write_failed",
+                    f"Could not write merge_manifest.json: {manifest_exc}",
+                    path=manifest_path,
+                )
+                manifest['manifest_write_error'] = str(manifest_exc)
             finally:
                 run_logger.close()
+                for temp_dir in zip_temp_dirs:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                # Deregister from atexit safety net after normal cleanup.
+                with _active_temp_dirs_lock:
+                    for temp_dir in zip_temp_dirs:
+                        _active_temp_dirs.discard(temp_dir)
 
         if fatal_exception is not None:
             raise RuntimeError(
@@ -1700,6 +2004,8 @@ class MergeOrchestrator:
                     continue
 
                 temp_dirs.append(extraction_root)
+                with _active_temp_dirs_lock:
+                    _active_temp_dirs.add(extraction_root)
                 extract_result = self.zip_archive_processor.extract_archive(
                     zip_file,
                     extraction_root,
@@ -1708,6 +2014,7 @@ class MergeOrchestrator:
                     depth=0,
                     depth_limit=self.zip_nested_depth_limit,
                     warnings=warnings,
+                    max_extract_bytes=self.zip_max_extract_bytes,
                 )
                 self._merge_zip_stats(zip_processing_summary, extract_result)
 
@@ -1734,6 +2041,53 @@ class MergeOrchestrator:
         return file_path.lower().endswith(supported)
 
     @staticmethod
+    def _relative_path_under(source_path: str, base_path: str) -> str:
+        try:
+            relative = os.path.relpath(source_path, base_path)
+            if relative.startswith(".."):
+                return os.path.basename(source_path)
+            return relative
+        except ValueError:
+            return os.path.basename(source_path)
+
+    @staticmethod
+    def _to_windows_long_path(path: str) -> str:
+        if os.name != "nt":
+            return path
+        normalized = os.path.abspath(path).replace("/", "\\")
+        if normalized.startswith("\\\\?\\"):
+            return normalized
+        return "\\\\?\\" + normalized
+
+    @classmethod
+    def _path_is_file(cls, path: str) -> bool:
+        if os.path.isfile(path):
+            return True
+        if os.name == "nt":
+            return os.path.isfile(cls._to_windows_long_path(path))
+        return False
+
+    @staticmethod
+    def _truncate_leaf_name(name: str, max_len: int = 120) -> str:
+        if max_len <= 0 or len(name) <= max_len:
+            return name
+        base, ext = os.path.splitext(name)
+        keep_base = max(1, max_len - len(ext))
+        return base[:keep_base] + ext
+
+    @classmethod
+    def _copy_or_move_file(cls, source: str, destination: str, action: str) -> None:
+        src = source
+        dst = destination
+        if os.name == "nt":
+            src = cls._to_windows_long_path(source)
+            dst = cls._to_windows_long_path(destination)
+        if action == "move":
+            shutil.move(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+    @staticmethod
     def _ensure_unique_destination(path: str) -> str:
         if not os.path.exists(path):
             return path
@@ -1745,63 +2099,156 @@ class MergeOrchestrator:
                 return candidate
         raise RuntimeError("Unable to allocate destination filename.")
 
-    def _move_unsupported_zip_files(
+    @staticmethod
+    def _sync_warning_events(
+        warnings: List[Dict],
+        cursor: int,
+        run_logger: Optional[RunLogger],
+    ) -> int:
+        if not run_logger:
+            return len(warnings)
+        while cursor < len(warnings):
+            warning = warnings[cursor]
+            code = warning.get("code", "warning")
+            message = warning.get("message", "")
+            context = {
+                key: value
+                for key, value in warning.items()
+                if key not in {"code", "message"}
+            }
+            run_logger.log("warning", code, message, **context)
+            cursor += 1
+        return cursor
+
+    def _relocate_unsupported_files(
         self,
-        unsupported_files: List[str],
-        group_name: str,
-        extraction_root: str,
-        unprocessed_root: str,
-        moved_unprocessed: List[Dict],
+        files_to_relocate: List[str],
+        target_root: str,
+        target_prefix: str,
+        base_path: str,
+        action: str,
+        reason: str,
+        origin: str,
+        stage: str,
         warnings: Optional[List[Dict]],
         run_logger: Optional[RunLogger] = None,
-    ) -> None:
-        for source_path in sorted(unsupported_files):
-            try:
-                relative = os.path.relpath(source_path, extraction_root)
-                if relative.startswith(".."):
-                    relative = os.path.basename(source_path)
-            except ValueError:
-                relative = os.path.basename(source_path)
+        success_event: str = "unsupported_file_relocated",
+        flatten: bool = False,
+    ) -> List[Dict]:
+        relocated_entries: List[Dict] = []
+        normalized_action = "move" if str(action).lower() == "move" else "copy"
 
-            destination = os.path.join(unprocessed_root, group_name, relative)
+        for source_path in sorted(files_to_relocate):
+            if flatten:
+                safe_name = self._truncate_leaf_name(os.path.basename(source_path))
+                destination = os.path.join(target_root, safe_name)
+            else:
+                relative = self._relative_path_under(source_path, base_path)
+                destination = os.path.join(target_root, target_prefix, relative)
             os.makedirs(os.path.dirname(destination), exist_ok=True)
             destination = self._ensure_unique_destination(destination)
 
             try:
-                shutil.move(source_path, destination)
+                self._copy_or_move_file(source_path, destination, normalized_action)
                 entry = {
                     "source": source_path,
                     "destination": destination,
-                    "reason": "unsupported_zip_file_moved",
+                    "action": normalized_action,
+                    "reason": reason,
+                    "origin": origin,
+                    "stage": stage,
                 }
-                moved_unprocessed.append(entry)
+                relocated_entries.append(entry)
                 if run_logger:
                     run_logger.log(
                         "info",
-                        "unsupported_moved",
-                        "Moved unsupported ZIP file",
+                        success_event,
+                        "Relocated unsupported file",
                         source=source_path,
                         destination=destination,
-                        group=group_name,
+                        action=normalized_action,
+                        reason=reason,
+                        origin=origin,
                     )
             except Exception as exc:
                 _record_warning(
                     warnings,
-                    'unsupported_move_failed',
-                    'Failed to move unsupported ZIP file',
+                    'unsupported_relocate_failed',
+                    'Failed to relocate unsupported file',
                     file=source_path,
                     destination=destination,
+                    action=normalized_action,
+                    reason=reason,
+                    origin=origin,
                     error=str(exc),
                 )
+        return relocated_entries
+
+    def _materialize_failed_artifacts(
+        self,
+        failed_files: List[Dict],
+        failed_root: str,
+        input_root: str,
+        action: str,
+        include_artifacts: bool,
+        warnings: Optional[List[Dict]],
+        run_logger: Optional[RunLogger] = None,
+    ) -> int:
+        created = 0
+        normalized_action = str(action).lower()
+        if normalized_action not in {"copy", "move", "metadata_only"}:
+            normalized_action = "copy"
+
+        for item in failed_files:
+            item["artifact_action"] = normalized_action
+            item["artifact_status"] = "not_created"
+            if not include_artifacts or normalized_action == "metadata_only":
+                continue
+
+            source = item.get("source")
+            if not source or "::" in source:
+                item["artifact_status"] = "source_missing"
+                continue
+            source = os.path.normpath(source)
+            if not self._path_is_file(source):
+                item["artifact_status"] = "source_missing"
+                continue
+
+            stage = item.get("stage") or "unknown"
+            leaf_name = self._truncate_leaf_name(os.path.basename(source))
+            destination = os.path.join(failed_root, stage, leaf_name)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            destination = self._ensure_unique_destination(destination)
+
+            try:
+                self._copy_or_move_file(source, destination, normalized_action)
+                item["artifact_destination"] = destination
+                item["artifact_status"] = "created"
+                created += 1
                 if run_logger:
                     run_logger.log(
-                        "warning",
-                        "unsupported_move_failed",
-                        "Failed moving unsupported ZIP file",
-                        source=source_path,
+                        "info",
+                        "failed_artifact_created",
+                        "Created failed file artifact",
+                        source=source,
                         destination=destination,
-                        error=str(exc),
+                        stage=stage,
+                        action=normalized_action,
                     )
+            except Exception as exc:
+                item["artifact_destination"] = destination
+                item["artifact_status"] = "copy_failed"
+                _record_warning(
+                    warnings,
+                    "failed_artifact_create_failed",
+                    "Failed to create artifact for failed file",
+                    file=source,
+                    destination=destination,
+                    stage=stage,
+                    action=normalized_action,
+                    error=str(exc),
+                )
+        return created
 
     @staticmethod
     def _collect_file_outcomes_from_warnings(
@@ -1879,7 +2326,7 @@ class MergeOrchestrator:
         bookmark_titles: Dict[str, str] = {}
 
         try:
-            with self.word_converter_factory(warnings=warnings) as converter:
+            with self.word_converter_factory(warnings=warnings, timeout_seconds=self.word_convert_timeout_seconds) as converter:
                 total_word_files = len(word_files)
                 for index, source_file in enumerate(word_files, 1):
                     converted_pdf = os.path.join(conversion_dir, f"{uuid.uuid4().hex}.pdf")
@@ -1910,8 +2357,7 @@ class MergeOrchestrator:
                                 processed=index,
                                 total=total_word_files,
                             )
-                        if progress_callback:
-                            progress_callback(message)
+                        _safe_progress(progress_callback, message)
 
             if not converted_pdf_files:
                 _record_warning(
@@ -1950,8 +2396,7 @@ class MergeOrchestrator:
             print(f"    {summary_message}")
             if run_logger:
                 run_logger.log("info", "word_conversion_summary", summary_message, group=group_name)
-            if progress_callback:
-                progress_callback(summary_message)
+            _safe_progress(progress_callback, summary_message)
             return doc_outputs, output_to_sources, conversion_summary
         finally:
             shutil.rmtree(conversion_dir, ignore_errors=True)
@@ -1978,9 +2423,14 @@ class MergeOrchestrator:
         self,
         email_files: List[str],
         warnings: Optional[List[Dict]] = None,
-    ) -> Dict[str, List[Dict]]:
+    ) -> Tuple[Dict[str, List[Dict]], Dict[str, int]]:
         """Extract and group email files into conversation threads."""
         email_data = []
+        stats = {
+            "parsed_total": 0,
+            "failed_total": 0,
+            "attachment_refs_total": 0,
+        }
         
         for email_file in email_files:
             if email_file.lower().endswith('.msg'):
@@ -1990,7 +2440,10 @@ class MergeOrchestrator:
             
             if data:
                 data['file_path'] = email_file
+                data['attachments'] = data.get('attachments', []) or []
                 email_data.append(data)
+                stats["parsed_total"] += 1
+                stats["attachment_refs_total"] += len(data['attachments'])
             else:
                 _record_warning(
                     warnings,
@@ -1998,9 +2451,114 @@ class MergeOrchestrator:
                     'Could not parse email file; skipping file',
                     file=email_file,
                 )
+                stats["failed_total"] += 1
         
         # Group into threads
-        return self.email_threader.group_emails(email_data)
+        return self.email_threader.group_emails(email_data), stats
+
+    def _render_email_entry(
+        self,
+        email: Dict[str, Any],
+        index: int,
+        total: int,
+    ) -> str:
+        lines = [
+            f"EMAIL {index} of {total}",
+            "=" * 80,
+            f"Subject: {email.get('subject', '')}",
+            f"From: {email.get('from', '')}",
+            f"To: {email.get('to', '')}",
+            f"CC: {email.get('cc', '')}",
+            f"Date: {email.get('date', '')}",
+            f"Source: {os.path.basename(email.get('file_path', ''))}",
+            "-" * 80,
+            "",
+            email.get('body', '') or "",
+            "",
+        ]
+
+        attachments = email.get("attachments", []) or []
+        if self.email_include_attachment_index:
+            lines.append("ATTACHMENTS:")
+            if attachments:
+                for attachment in attachments:
+                    size_bytes = attachment.get("size_bytes")
+                    size_display = str(size_bytes) if size_bytes is not None else "unknown"
+                    lines.append(
+                        f"- {attachment.get('filename', 'unnamed_attachment')} "
+                        f"(type={attachment.get('content_type', '')}, bytes={size_display})"
+                    )
+            else:
+                lines.append("- none")
+            lines.append("")
+
+        lines.append("=" * 80)
+        lines.append("")
+        return "\n".join(lines)
+
+    def _render_thread_block(
+        self,
+        thread_num: int,
+        thread_key: str,
+        emails: List[Dict[str, Any]],
+    ) -> str:
+        normalized_key = thread_key or "(no subject)"
+        block_lines = [
+            f"EMAIL THREAD {thread_num}",
+            f"THREAD KEY: {normalized_key}",
+            f"TOTAL EMAILS: {len(emails)}",
+            "=" * 80,
+            "",
+        ]
+        for idx, email in enumerate(emails, 1):
+            try:
+                block_lines.append(self._render_email_entry(email, idx, len(emails)))
+            except Exception as exc:
+                block_lines.append(
+                    f"--- Email {idx}/{len(emails)}: RENDER FAILED ({exc}) ---\n"
+                )
+        return "\n".join(block_lines)
+
+    def _write_email_outputs(
+        self,
+        threads: Dict[str, List[Dict]],
+        output_path: str,
+        group_name: str,
+        current_output_count: int,
+        warnings: Optional[List[Dict]] = None,
+        run_logger: Optional[RunLogger] = None,
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        if self.email_output_mode == "threaded":
+            self._ensure_output_capacity(
+                len(threads),
+                current_output_count,
+                f"group '{group_name}' email threads",
+            )
+            outputs = self._write_email_threads(threads, output_path, group_name)
+            output_total_bytes = 0
+            for file_path in outputs:
+                try:
+                    output_total_bytes += os.path.getsize(file_path)
+                except OSError:
+                    pass
+            batch_map = {}
+            for index, (thread_key, emails) in enumerate(sorted(threads.items()), 1):
+                key = os.path.join(output_path, f"{group_name}_emails_thread{index}.txt")
+                batch_map[key] = [{"thread_key": thread_key, "email_count": len(emails)}]
+            return outputs, {
+                "threads_total": len(threads),
+                "batches_total": len(outputs),
+                "output_total_bytes": output_total_bytes,
+                "batch_to_threads": batch_map,
+            }
+        return self._write_email_batches(
+            threads=threads,
+            output_path=output_path,
+            group_name=group_name,
+            current_output_count=current_output_count,
+            warnings=warnings,
+            run_logger=run_logger,
+        )
 
     def _write_email_threads(
         self,
@@ -2013,33 +2571,121 @@ class MergeOrchestrator:
 
         # Write thread files
         output_files = []
-        for thread_num, (_, emails) in enumerate(sorted(threads.items()), 1):
+        for thread_num, (thread_key, emails) in enumerate(sorted(threads.items()), 1):
             output_file = os.path.join(output_path, f"{group_name}_emails_thread{thread_num}.txt")
             
             with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(f"EMAIL THREAD {thread_num}\n")
                 f.write(f"GROUP: {group_name}\n")
-                f.write(f"TOTAL EMAILS: {len(emails)}\n")
-                f.write("=" * 80 + "\n\n")
-                
-                for idx, email in enumerate(emails, 1):
-                    f.write(f"EMAIL {idx} of {len(emails)}\n")
-                    f.write("=" * 80 + "\n")
-                    f.write(f"Subject: {email.get('subject', '')}\n")
-                    f.write(f"From: {email.get('from', '')}\n")
-                    f.write(f"To: {email.get('to', '')}\n")
-                    f.write(f"Date: {email.get('date', '')}\n")
-                    f.write(f"Source: {os.path.basename(email.get('file_path', ''))}\n")
-                    f.write("-" * 80 + "\n\n")
-                    f.write(email.get('body', '') + "\n\n")
-                    f.write("=" * 80 + "\n\n")
+                f.write(self._render_thread_block(thread_num, thread_key, emails))
             
             output_files.append(output_file)
             print(f"    Created: {os.path.basename(output_file)} ({len(emails)} emails)")
         
         return output_files
 
+    def _write_email_batches(
+        self,
+        threads: Dict[str, List[Dict]],
+        output_path: str,
+        group_name: str,
+        current_output_count: int,
+        warnings: Optional[List[Dict]] = None,
+        run_logger: Optional[RunLogger] = None,
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        os.makedirs(output_path, exist_ok=True)
+        max_batch_bytes = self.email_max_output_file_mb * 1024 * 1024
+        thread_blocks = []
+        for thread_num, (thread_key, emails) in enumerate(sorted(threads.items()), 1):
+            block_text = self._render_thread_block(thread_num, thread_key, emails)
+            block_bytes = len(block_text.encode("utf-8"))
+            thread_blocks.append(
+                {
+                    "thread_key": thread_key,
+                    "email_count": len(emails),
+                    "thread_num": thread_num,
+                    "text": block_text,
+                    "bytes": block_bytes,
+                }
+            )
+
+        planned_batches: List[List[Dict[str, Any]]] = []
+        current_batch: List[Dict[str, Any]] = []
+        current_size = 0
+        for block in thread_blocks:
+            block_size = block["bytes"]
+            if current_batch and current_size + block_size > max_batch_bytes:
+                planned_batches.append(current_batch)
+                current_batch = []
+                current_size = 0
+            current_batch.append(block)
+            current_size += block_size
+            if block_size > max_batch_bytes:
+                _record_warning(
+                    warnings,
+                    "email_thread_exceeds_batch_cap",
+                    "Email thread exceeds configured batch size cap; writing dedicated batch file",
+                    thread_key=block["thread_key"],
+                    group=group_name,
+                    thread_bytes=block_size,
+                    batch_limit_bytes=max_batch_bytes,
+                )
+        if current_batch:
+            planned_batches.append(current_batch)
+
+        self._ensure_output_capacity(
+            len(planned_batches),
+            current_output_count,
+            f"group '{group_name}' email batches",
+        )
+
+        output_files: List[str] = []
+        output_total_bytes = 0
+        batch_to_threads: Dict[str, List[Dict[str, Any]]] = {}
+        for batch_num, batch_blocks in enumerate(planned_batches, 1):
+            output_file = os.path.join(output_path, f"{group_name}_{self.email_batch_name_prefix}{batch_num}.txt")
+            with open(output_file, "w", encoding="utf-8") as handle:
+                handle.write(f"EMAIL BATCH {batch_num}\n")
+                handle.write(f"GROUP: {group_name}\n")
+                handle.write(f"BATCH THREADS: {len(batch_blocks)}\n")
+                handle.write("=" * 80 + "\n\n")
+                for idx, block in enumerate(batch_blocks):
+                    if idx > 0:
+                        handle.write("\n")
+                    handle.write(block["text"])
+
+            try:
+                file_size = os.path.getsize(output_file)
+            except OSError:
+                file_size = 0
+            output_total_bytes += file_size
+            output_files.append(output_file)
+            batch_to_threads[output_file] = [
+                {
+                    "thread_key": block["thread_key"],
+                    "email_count": block["email_count"],
+                }
+                for block in batch_blocks
+            ]
+            if run_logger:
+                run_logger.log(
+                    "info",
+                    "email_batch_written",
+                    "Wrote email batch output",
+                    group=group_name,
+                    batch_file=output_file,
+                    thread_count=len(batch_blocks),
+                    bytes=file_size,
+                )
+            print(f"    Created: {os.path.basename(output_file)} ({len(batch_blocks)} threads)")
+
+        return output_files, {
+            "threads_total": len(threads),
+            "batches_total": len(output_files),
+            "output_total_bytes": output_total_bytes,
+            "batch_to_threads": batch_to_threads,
+        }
+
     def _process_emails(self, email_files: List[str], output_path: str, group_name: str) -> List[str]:
         """Backward-compatible wrapper for email processing."""
-        email_threads = self._prepare_email_threads(email_files)
+        email_threads, _ = self._prepare_email_threads(email_files)
         return self._write_email_threads(email_threads, output_path, group_name)

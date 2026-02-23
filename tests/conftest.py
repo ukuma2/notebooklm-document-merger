@@ -85,8 +85,9 @@ def make_eml(tmp_path: Path):
 def patch_word_converter(monkeypatch):
     def _patch(fail_contains: str = ""):
         class FakeWordConverter:
-            def __init__(self, warnings=None):
+            def __init__(self, warnings=None, timeout_seconds=120):
                 self.warnings = warnings
+                self.timeout_seconds = timeout_seconds
 
             @staticmethod
             def is_available():
