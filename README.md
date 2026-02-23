@@ -153,17 +153,27 @@ notebooklm-document-merger/
 
 To create a `.exe` file that doesn't require Python:
 
-1. Install PyInstaller:
-   ```bash
-   pip install pyinstaller
-   ```
+**Option 1: One-Click Build (Easiest)**
+```bash
+build.bat
+```
+Or:
+```bash
+python build_exe.py
+```
 
-2. Build executable:
-   ```bash
-   pyinstaller --name="NotebookLM_Merger" --onefile --windowed document_merger_gui.py
-   ```
+**Option 2: Manual Build**
+```bash
+pip install pyinstaller
+pyinstaller NotebookLM_Merger.spec
+```
 
-3. Find executable in `dist/` folder
+The executable will be created in `dist/NotebookLM_Merger.exe` — a single portable file (~80-120 MB) with no dependencies.
+
+**For Distribution:**
+- Simply copy `dist/NotebookLM_Merger.exe` to users
+- No Python installation needed on their machine
+- Requires Microsoft Word for `.doc`/`.docx` conversion
 
 ---
 
