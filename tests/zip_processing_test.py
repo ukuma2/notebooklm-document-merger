@@ -46,7 +46,7 @@ def test_zip_with_long_email_names_extracts_and_threads(tmp_path):
 
     assert result["total_output_files"] == 1
     thread_file = Path(result["output_files"][0])
-    assert thread_file.name.startswith("root_emails_emails_thread")
+    assert thread_file.name.startswith("root_emails_emails_batch")
     assert "Body from long filename" in thread_file.read_text(encoding="utf-8")
     assert result["zip_processing"]["entries_renamed"] > 0
 
@@ -169,8 +169,8 @@ def test_mixed_zip_and_plain_files_processed_together(tmp_path):
     result = _run_email_only(input_dir, output_dir)
 
     output_names = [Path(path).name for path in result["output_files"]]
-    assert any(name.startswith("root_emails_thread") for name in output_names)
-    assert any(name.startswith("root_bundle_emails_thread") for name in output_names)
+    assert any(name.startswith("root_emails_batch") for name in output_names)
+    assert any(name.startswith("root_bundle_emails_batch") for name in output_names)
 
 
 def test_single_zip_file_path_input_supported(tmp_path):
@@ -215,8 +215,30 @@ def test_zip_unsupported_files_are_moved_to_unprocessed_folder(tmp_path):
     for item in moved:
         assert Path(item["destination"]).exists()
         assert str(item["destination"]).startswith(result["paths"]["unprocessed_dir"])
+        assert Path(item["destination"]).parent == Path(result["paths"]["unprocessed_dir"])
+    assert len(result["files"]["unprocessed"]) == 2
 
     processed_manifest = Path(result["paths"]["processed_dir"]) / "merge_manifest.json"
     assert processed_manifest.exists()
     assert Path(result["logs"]["text_log"]).exists()
     assert Path(result["logs"]["jsonl_log"]).exists()
+
+
+def test_input_unsupported_files_are_copied_to_unprocessed_folder(tmp_path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    (input_dir / "mail.eml").write_text(_build_eml("Subject", "Body"), encoding="utf-8")
+    (input_dir / "meta.xml").write_text("<root/>", encoding="utf-8")
+    (input_dir / "image.png").write_bytes(b"png")
+
+    result = _run_email_only(input_dir, output_dir)
+
+    assert result["summary"]["unprocessed_relocated_total"] == 2
+    unprocessed = result["files"]["unprocessed"]
+    assert len(unprocessed) == 2
+    assert all(item["origin"] == "input" for item in unprocessed)
+    assert all(item["action"] == "copy" for item in unprocessed)
+    for item in unprocessed:
+        assert Path(item["destination"]).exists()
+        assert Path(item["destination"]).parent == Path(result["paths"]["unprocessed_dir"])

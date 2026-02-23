@@ -38,6 +38,8 @@ def test_email_only_creates_output_directory_and_manifest(tmp_path):
     assert result["paths"]["unprocessed_dir"].endswith("unprocessed")
     assert "limits" in result
     assert result["limits"]["max_output_files"] == 300
+    assert "unprocessed_relocated_total" in result["summary"]
+    assert "failed_artifacts_total" in result["summary"]
 
 
 def test_output_directory_nested_in_input_is_excluded_from_scan(tmp_path):

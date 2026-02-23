@@ -6,6 +6,7 @@ User-friendly interface for merging documents into NotebookLM-compatible batches
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+from collections import deque
 import os
 import platform
 import subprocess
@@ -17,8 +18,8 @@ class DocumentMergerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("NotebookLM Document Merger v2.0")
-        self.root.geometry("600x550")
-        self.root.resizable(False, False)
+        self.root.geometry("900x760")
+        self.root.resizable(True, True)
         
         # Variables
         self.input_folder = tk.StringVar()
@@ -30,6 +31,11 @@ class DocumentMergerGUI:
         self.process_pdfs = tk.BooleanVar(value=True)
         self.process_docx = tk.BooleanVar(value=True)
         self.process_emails = tk.BooleanVar(value=True)
+        self.unprocessed_count_var = tk.IntVar(value=0)
+        self.failed_count_var = tk.IntVar(value=0)
+        self.skipped_count_var = tk.IntVar(value=0)
+        self.recent_paths_var = tk.StringVar(value="Recent moved/failed files: none")
+        self.recent_paths = deque(maxlen=10)
         
         self.is_processing = False
         
@@ -56,6 +62,9 @@ class DocumentMergerGUI:
         # Main content frame
         content_frame = tk.Frame(self.root, padx=20, pady=20)
         content_frame.pack(fill=tk.BOTH, expand=True)
+        content_frame.grid_columnconfigure(0, weight=1)
+        content_frame.grid_columnconfigure(1, weight=1)
+        content_frame.grid_rowconfigure(12, weight=1)
         
         # Input folder/zip selection
         tk.Label(content_frame, text="Input Folder or ZIP:", font=('Arial', 10, 'bold')).grid(
@@ -147,6 +156,39 @@ class DocumentMergerGUI:
         
         self.output_files_label = tk.Label(stats_frame, text="Output Files: 0", fg='#666')
         self.output_files_label.grid(row=0, column=2, sticky='w', padx=(20, 0))
+
+        self.unprocessed_label = tk.Label(stats_frame, text="Unprocessed Relocated: 0", fg='#666')
+        self.unprocessed_label.grid(row=1, column=0, sticky='w', pady=(6, 0))
+
+        self.failed_label = tk.Label(stats_frame, text="Failed Files: 0", fg='#666')
+        self.failed_label.grid(row=1, column=1, sticky='w', padx=(20, 0), pady=(6, 0))
+
+        self.skipped_label = tk.Label(stats_frame, text="Skipped Files: 0", fg='#666')
+        self.skipped_label.grid(row=1, column=2, sticky='w', padx=(20, 0), pady=(6, 0))
+
+        self.recent_paths_label = tk.Label(
+            content_frame,
+            textvariable=self.recent_paths_var,
+            fg='#666',
+            justify='left',
+            anchor='w',
+            wraplength=820,
+        )
+        self.recent_paths_label.grid(row=10, column=0, columnspan=2, sticky='ew', pady=(10, 5))
+
+        tk.Label(content_frame, text="Live Run Log:", font=('Arial', 10, 'bold')).grid(
+            row=11, column=0, columnspan=2, sticky='w', pady=(4, 4)
+        )
+
+        log_frame = tk.Frame(content_frame)
+        log_frame.grid(row=12, column=0, columnspan=2, sticky='nsew')
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(0, weight=1)
+        self.log_text = tk.Text(log_frame, height=14, wrap='word', state='disabled')
+        self.log_text.grid(row=0, column=0, sticky='nsew')
+        log_scroll = ttk.Scrollbar(log_frame, orient='vertical', command=self.log_text.yview)
+        log_scroll.grid(row=0, column=1, sticky='ns')
+        self.log_text.configure(yscrollcommand=log_scroll.set)
         
     def browse_input(self):
         """Open folder browser for input directory"""
@@ -165,20 +207,89 @@ class DocumentMergerGUI:
 
     def _set_input_path(self, path):
         self.input_folder.set(path)
-        # Auto-suggest output folder
-        if not self.output_folder.get():
-            if os.path.isfile(path) and path.lower().endswith('.zip'):
-                zip_name = Path(path).stem
-                suggested_output = os.path.join(os.path.dirname(path), f"{zip_name}_merged_output")
-            else:
-                suggested_output = os.path.join(path, "merged_output")
-            self.output_folder.set(suggested_output)
+        # Always refresh output suggestion when input changes.
+        if os.path.isfile(path) and path.lower().endswith('.zip'):
+            zip_name = Path(path).stem
+            suggested_output = os.path.join(os.path.dirname(path), f"{zip_name}_merged_output")
+        else:
+            suggested_output = os.path.join(path, "merged_output")
+        self.output_folder.set(suggested_output)
     
     def browse_output(self):
         """Open folder browser for output directory"""
         folder = filedialog.askdirectory(title="Select Output Folder")
         if folder:
             self.output_folder.set(folder)
+
+    def _append_log(self, line):
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, line + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
+
+    def _reset_live_state(self):
+        self.unprocessed_count_var.set(0)
+        self.failed_count_var.set(0)
+        self.skipped_count_var.set(0)
+        self.unprocessed_label.config(text="Unprocessed Relocated: 0")
+        self.failed_label.config(text="Failed Files: 0")
+        self.skipped_label.config(text="Skipped Files: 0")
+        self.recent_paths.clear()
+        self.recent_paths_var.set("Recent moved/failed files: none")
+        self.log_text.config(state='normal')
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.config(state='disabled')
+
+    def _update_recent_paths(self):
+        if not self.recent_paths:
+            self.recent_paths_var.set("Recent moved/failed files: none")
+            return
+        rendered = "\n".join(f"- {item}" for item in list(self.recent_paths))
+        self.recent_paths_var.set(f"Recent moved/failed files:\n{rendered}")
+
+    def on_progress_update(self, current, total, message):
+        self.root.after(0, self._handle_progress_update, current, total, message)
+
+    def _handle_progress_update(self, current, total, message):
+        self.status_label.config(text=f"Status: {message}", fg='#2E86AB')
+        self.files_processed_label.config(text=f"Files Processed: {current}/{max(total, 1)}")
+        self._append_log(f"[PROGRESS] {message} ({current}/{total})")
+
+    def on_run_event(self, payload):
+        self.root.after(0, self._handle_run_event, payload)
+
+    def _handle_run_event(self, payload):
+        if not isinstance(payload, dict):
+            return
+        level = str(payload.get("level", "INFO")).upper()
+        event = str(payload.get("event", "event"))
+        message = str(payload.get("message", ""))
+        context = payload.get("context", {}) or {}
+        self._append_log(f"[{level}] {event}: {message}")
+
+        if event in {"unsupported_input_file_relocated", "unsupported_zip_file_relocated"}:
+            self.unprocessed_count_var.set(self.unprocessed_count_var.get() + 1)
+        if level in {"WARNING", "ERROR"}:
+            code = event.lower()
+            if code in {"zip_entry_skipped_unsafe_path", "zip_nested_depth_exceeded", "zip_empty_after_extraction"}:
+                self.skipped_count_var.set(self.skipped_count_var.get() + 1)
+            else:
+                self.failed_count_var.set(self.failed_count_var.get() + 1)
+        if event == "failed_artifact_created":
+            self.failed_count_var.set(max(self.failed_count_var.get(), 1))
+
+        self.unprocessed_label.config(text=f"Unprocessed Relocated: {self.unprocessed_count_var.get()}")
+        self.failed_label.config(text=f"Failed Files: {self.failed_count_var.get()}")
+        self.skipped_label.config(text=f"Skipped Files: {self.skipped_count_var.get()}")
+
+        source = context.get("source") or context.get("file")
+        destination = context.get("destination")
+        if source or destination:
+            if source and destination:
+                self.recent_paths.append(f"{source} -> {destination}")
+            else:
+                self.recent_paths.append(str(source or destination))
+            self._update_recent_paths()
     
     def start_merge(self):
         """Start the merging process"""
@@ -211,6 +322,8 @@ class DocumentMergerGUI:
         self.start_button.config(state='disabled', text='Processing...')
         self.progress.start(10)
         self.status_label.config(text="Status: Processing...", fg='#2E86AB')
+        self._reset_live_state()
+        self._append_log("Run started.")
         
         thread = threading.Thread(target=self.run_merge, daemon=True)
         thread.start()
@@ -230,7 +343,9 @@ class DocumentMergerGUI:
             # Run merge
             result = orchestrator.merge_documents(
                 self.input_folder.get(),
-                self.output_folder.get()
+                self.output_folder.get(),
+                progress_callback=self.on_progress_update,
+                event_callback=self.on_run_event,
             )
             
             # Update UI on success
@@ -250,17 +365,40 @@ class DocumentMergerGUI:
         summary = result.get("summary", {})
         paths = result.get("paths", {})
         logs = result.get("logs", {})
+        files = result.get("files", {})
 
         input_total = summary.get("input_files_total", result.get("total_input_files", 0))
         processed_total = summary.get("processed_outputs_total", result.get("total_output_files", 0))
-        moved_total = summary.get("moved_unprocessed_total", 0)
+        moved_total = summary.get("unprocessed_relocated_total", summary.get("moved_unprocessed_total", 0))
         failed_total = summary.get("failed_files_total", 0)
+        failed_artifacts_total = summary.get("failed_artifacts_total", 0)
         skipped_total = summary.get("skipped_files_total", 0)
 
         # Update statistics
         self.files_found_label.config(text=f"Files Found: {input_total}")
         self.files_processed_label.config(text=f"Files Processed: {input_total}")
         self.output_files_label.config(text=f"Output Files: {processed_total}")
+        self.unprocessed_label.config(text=f"Unprocessed Relocated: {moved_total}")
+        self.failed_label.config(text=f"Failed Files: {failed_total}")
+        self.skipped_label.config(text=f"Skipped Files: {skipped_total}")
+        for failed_item in files.get("failed", [])[:10]:
+            source = failed_item.get("source")
+            artifact = failed_item.get("artifact_destination")
+            if source and artifact:
+                self.recent_paths.append(f"{source} -> {artifact}")
+            elif source:
+                self.recent_paths.append(str(source))
+        self._update_recent_paths()
+        self._append_log("Run completed.")
+
+        failed_preview = ""
+        if files.get("failed"):
+            preview_lines = []
+            for item in files["failed"][:3]:
+                src = item.get("source", "unknown")
+                status = item.get("artifact_status", "unknown")
+                preview_lines.append(f"- {src} ({status})")
+            failed_preview = "Failed file details:\n" + "\n".join(preview_lines) + "\n\n"
         
         # Show success message
         messagebox.showinfo(
@@ -268,14 +406,16 @@ class DocumentMergerGUI:
             f"Merge complete!\n\n"
             f"Input files: {input_total}\n"
             f"Processed outputs: {processed_total}\n"
-            f"Moved (unprocessed): {moved_total}\n"
+            f"Unprocessed relocated: {moved_total}\n"
             f"Failed files: {failed_total}\n"
+            f"Failed artifacts created: {failed_artifacts_total}\n"
             f"Skipped files: {skipped_total}\n\n"
             f"Processed folder:\n{paths.get('processed_dir', self.output_folder.get())}\n\n"
             f"Unprocessed folder:\n{paths.get('unprocessed_dir', self.output_folder.get())}\n\n"
             f"Failed folder:\n{paths.get('failed_dir', self.output_folder.get())}\n\n"
             f"Manifest:\n{os.path.join(paths.get('processed_dir', self.output_folder.get()), 'merge_manifest.json')}\n\n"
-            f"Run log:\n{logs.get('text_log', 'N/A')}"
+            f"Run log:\n{logs.get('text_log', 'N/A')}\n\n"
+            f"{failed_preview}"
         )
         
         # Ask if user wants to open output folder
@@ -299,7 +439,8 @@ class DocumentMergerGUI:
         self.is_processing = False
         self.start_button.config(state='normal', text='🚀 Start Merging')
         self.status_label.config(text="Status: Error", fg='#dc3545')
-        
+        self._append_log(f"[ERROR] {error_msg}")
+
         messagebox.showerror("Error", f"An error occurred during merging:\n\n{error_msg}")
 
 
