@@ -352,6 +352,7 @@ Built for use with [Google NotebookLM](https://notebooklm.google.com/)
 ## ðŸ“§ Support
 
 For issues or questions, please [open an issue](https://github.com/YOUR_USERNAME/notebooklm-document-merger/issues) on GitHub.
+Implementation and operational handover details are in [docs/IMPLEMENTATION_HANDOVER.md](docs/IMPLEMENTATION_HANDOVER.md).
 
 ---
 
