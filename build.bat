@@ -7,6 +7,9 @@ REM  Requirements:
 REM    - Python 3.9+ installed and on PATH
 REM    - All runtime dependencies installed
 REM      (pip install -r requirements.txt)
+REM
+REM  Tip: If you get permission errors, try running as
+REM       Administrator (right-click → Run as administrator)
 REM =====================================================
 
 echo.
