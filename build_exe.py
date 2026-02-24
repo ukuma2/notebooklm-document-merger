@@ -80,7 +80,7 @@ def main():
 
     # Add icon if it exists
     if ICON.exists():
-        cmd.insert(cmd.index("--clean"), f"--icon={ICON}")
+        cmd.insert(cmd.index(str(ENTRY)), f"--icon={ICON}")
     else:
         print(f"INFO: No icon found at {ICON} — building without icon.")
         print("      To add a firm icon, place a .ico file at assets/icon.ico and rebuild.")
