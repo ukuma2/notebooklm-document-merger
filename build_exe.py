@@ -32,11 +32,11 @@ def cleanup_build_dirs():
             try:
                 print(f"Cleaning {dirname}/ directory...")
                 shutil.rmtree(dirpath)
-                # Small delay to ensure OS releases file locks
-                time.sleep(0.5)
             except PermissionError:
                 print(f"  WARNING: Could not fully remove {dirname}/ (may be locked)")
                 print(f"  Attempting to continue anyway...")
+            # Small delay to ensure OS releases file locks, even if deletion partially failed
+            time.sleep(0.5)
 
 
 def main():
