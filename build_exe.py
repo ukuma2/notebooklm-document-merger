@@ -14,12 +14,29 @@ Requirements:
 import subprocess
 import sys
 import os
+import shutil
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).parent
 ICON = ROOT / "assets" / "icon.ico"
 ENTRY = ROOT / "document_merger_gui.py"
 APP_NAME = "NotebookLM_Merger"
+
+
+def cleanup_build_dirs():
+    """Safely remove build and dist directories to prevent PyInstaller cleanup errors."""
+    for dirname in ["build", "dist"]:
+        dirpath = ROOT / dirname
+        if dirpath.exists():
+            try:
+                print(f"Cleaning {dirname}/ directory...")
+                shutil.rmtree(dirpath)
+                # Small delay to ensure OS releases file locks
+                time.sleep(0.5)
+            except PermissionError:
+                print(f"  WARNING: Could not fully remove {dirname}/ (may be locked)")
+                print(f"  Attempting to continue anyway...")
 
 
 def main():
@@ -33,6 +50,9 @@ def main():
     except ImportError:
         print("PyInstaller not found. Installing...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller>=6.0"])
+
+    # Clean up build directories before PyInstaller runs
+    cleanup_build_dirs()
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -55,8 +75,6 @@ def main():
         "--hidden-import=pywintypes",
         # extract_msg uses pkg_resources / importlib.metadata internally
         "--collect-all=extract_msg",
-        # Clean build artifacts before building
-        "--clean",
         str(ENTRY),
     ]
 
