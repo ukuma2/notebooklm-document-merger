@@ -2594,10 +2594,12 @@ class MergeOrchestrator:
     ) -> Tuple[List[str], Dict[str, Any]]:
         os.makedirs(output_path, exist_ok=True)
         max_batch_bytes = self.email_max_output_file_mb * 1024 * 1024
+        max_batch_words = 50000  # netdoc word limit
         thread_blocks = []
         for thread_num, (thread_key, emails) in enumerate(sorted(threads.items()), 1):
             block_text = self._render_thread_block(thread_num, thread_key, emails)
             block_bytes = len(block_text.encode("utf-8"))
+            block_words = len(block_text.split())
             thread_blocks.append(
                 {
                     "thread_key": thread_key,
@@ -2605,20 +2607,25 @@ class MergeOrchestrator:
                     "thread_num": thread_num,
                     "text": block_text,
                     "bytes": block_bytes,
+                    "words": block_words,
                 }
             )
 
         planned_batches: List[List[Dict[str, Any]]] = []
         current_batch: List[Dict[str, Any]] = []
         current_size = 0
+        current_words = 0
         for block in thread_blocks:
             block_size = block["bytes"]
-            if current_batch and current_size + block_size > max_batch_bytes:
+            block_words = block["words"]
+            if current_batch and (current_size + block_size > max_batch_bytes or current_words + block_words > max_batch_words):
                 planned_batches.append(current_batch)
                 current_batch = []
                 current_size = 0
+                current_words = 0
             current_batch.append(block)
             current_size += block_size
+            current_words += block_words
             if block_size > max_batch_bytes:
                 _record_warning(
                     warnings,
@@ -2628,6 +2635,16 @@ class MergeOrchestrator:
                     group=group_name,
                     thread_bytes=block_size,
                     batch_limit_bytes=max_batch_bytes,
+                )
+            if block_words > max_batch_words:
+                _record_warning(
+                    warnings,
+                    "email_thread_exceeds_word_cap",
+                    "Email thread exceeds netdoc word limit (50000); writing dedicated batch file",
+                    thread_key=block["thread_key"],
+                    group=group_name,
+                    thread_words=block_words,
+                    batch_limit_words=max_batch_words,
                 )
         if current_batch:
             planned_batches.append(current_batch)
@@ -2643,10 +2660,12 @@ class MergeOrchestrator:
         batch_to_threads: Dict[str, List[Dict[str, Any]]] = {}
         for batch_num, batch_blocks in enumerate(planned_batches, 1):
             output_file = os.path.join(output_path, f"{group_name}_{self.email_batch_name_prefix}{batch_num}.txt")
+            batch_word_count = sum(block["words"] for block in batch_blocks)
             with open(output_file, "w", encoding="utf-8") as handle:
                 handle.write(f"EMAIL BATCH {batch_num}\n")
                 handle.write(f"GROUP: {group_name}\n")
                 handle.write(f"BATCH THREADS: {len(batch_blocks)}\n")
+                handle.write(f"BATCH WORDS: {batch_word_count}\n")
                 handle.write("=" * 80 + "\n\n")
                 for idx, block in enumerate(batch_blocks):
                     if idx > 0:
@@ -2675,8 +2694,9 @@ class MergeOrchestrator:
                     batch_file=output_file,
                     thread_count=len(batch_blocks),
                     bytes=file_size,
+                    words=batch_word_count,
                 )
-            print(f"    Created: {os.path.basename(output_file)} ({len(batch_blocks)} threads)")
+            print(f"    Created: {os.path.basename(output_file)} ({len(batch_blocks)} threads, {batch_word_count} words)")
 
         return output_files, {
             "threads_total": len(threads),
