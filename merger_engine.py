@@ -435,21 +435,50 @@ class PDFMerger:
         if not pdf_files:
             return 0
 
-        batches = 1
+        max_batch_words = 50000
+        max_pages_per_chunk = max_batch_words // 250
+        batches = 0
         current_batch_size = 0
+        current_batch_words = 0
 
         for pdf_file in pdf_files:
             try:
                 file_size = os.path.getsize(pdf_file)
             except OSError:
-                # Avoid underestimating in preflight checks.
                 file_size = self.max_file_size_bytes
 
-            if current_batch_size and (current_batch_size + file_size > self.max_file_size_bytes):
+            file_words = self._estimate_pdf_word_count(pdf_file)
+
+            # Oversized single file — estimate how many chunks it splits into
+            if file_size > self.max_file_size_bytes or file_words > max_batch_words:
+                try:
+                    reader = PdfReader(pdf_file)
+                    total_pages = len(reader.pages)
+                except Exception:
+                    total_pages = max(1, file_words // 250) if file_words else 1
+                bytes_per_page = file_size / total_pages if total_pages else file_size
+                max_pages_by_size = max(1, int(self.max_file_size_bytes / bytes_per_page))
+                chunk_size = max(1, min(max_pages_per_chunk, max_pages_by_size))
+                # Flush current batch if it has content
+                if current_batch_size > 0:
+                    batches += 1
+                    current_batch_size = 0
+                    current_batch_words = 0
+                import math
+                batches += math.ceil(total_pages / chunk_size)
+                continue
+
+            if current_batch_size and (current_batch_size + file_size > self.max_file_size_bytes or
+                                       current_batch_words + file_words > max_batch_words):
                 batches += 1
                 current_batch_size = 0
+                current_batch_words = 0
 
             current_batch_size += file_size
+            current_batch_words += file_words
+
+        if current_batch_size > 0:
+            batches += 1
 
         return batches
 
@@ -488,7 +517,30 @@ class PDFMerger:
         current_batch_size = 0
         current_batch_words = 0
         max_batch_words = 50000  # netdoc word limit
+        max_pages_per_chunk = max_batch_words // 250  # ~200 pages
         batch_num = 1
+
+        def _flush_batch():
+            nonlocal batch_num, current_batch, current_batch_size, current_batch_words
+            if not current_batch:
+                return
+            output_file = self._save_pdf_batch(
+                current_batch,
+                output_path,
+                group_name,
+                batch_num,
+                warnings,
+                output_label=output_label,
+                bookmark_titles=bookmark_titles,
+                source_file_map=source_file_map,
+                output_to_sources=output_to_sources,
+            )
+            if output_file:
+                output_files.append(output_file)
+            batch_num += 1
+            current_batch = []
+            current_batch_size = 0
+            current_batch_words = 0
 
         for pdf_file in pdf_files:
             try:
@@ -506,57 +558,37 @@ class PDFMerger:
             # Estimate word count from page count (fast, no text extraction)
             file_words = self._estimate_pdf_word_count(pdf_file)
 
-            # If adding this file would exceed limit, save current batch
-            if current_batch and (current_batch_size + file_size > self.max_file_size_bytes or
-                                  current_batch_words + file_words > max_batch_words):
-                output_file = self._save_pdf_batch(
-                    current_batch,
-                    output_path,
-                    group_name,
-                    batch_num,
-                    warnings,
+            # Check if this single file needs page-level splitting
+            needs_split = (file_size > self.max_file_size_bytes or
+                           file_words > max_batch_words)
+
+            if needs_split:
+                # Flush any pending batch before splitting
+                _flush_batch()
+                # Split the oversized PDF by page ranges
+                split_files = self._split_oversized_pdf(
+                    pdf_file, output_path, group_name, batch_num,
+                    max_pages_per_chunk, warnings,
                     output_label=output_label,
                     bookmark_titles=bookmark_titles,
                     source_file_map=source_file_map,
                     output_to_sources=output_to_sources,
                 )
-                if output_file:
-                    output_files.append(output_file)
-                batch_num += 1
-                current_batch = []
-                current_batch_size = 0
-                current_batch_words = 0
+                output_files.extend(split_files)
+                batch_num += len(split_files)
+                continue
+
+            # If adding this file would exceed limit, save current batch
+            if current_batch and (current_batch_size + file_size > self.max_file_size_bytes or
+                                  current_batch_words + file_words > max_batch_words):
+                _flush_batch()
 
             current_batch.append(pdf_file)
             current_batch_size += file_size
             current_batch_words += file_words
 
-            # Warn if single file exceeds word limit
-            if file_words > max_batch_words:
-                _record_warning(
-                    warnings,
-                    'pdf_exceeds_word_cap',
-                    'PDF exceeds netdoc word limit (50000); writing dedicated batch file',
-                    file=pdf_file,
-                    file_words=file_words,
-                    batch_limit_words=max_batch_words,
-                )
-        
         # Save remaining files
-        if current_batch:
-            output_file = self._save_pdf_batch(
-                current_batch,
-                output_path,
-                group_name,
-                batch_num,
-                warnings,
-                output_label=output_label,
-                bookmark_titles=bookmark_titles,
-                source_file_map=source_file_map,
-                output_to_sources=output_to_sources,
-            )
-            if output_file:
-                output_files.append(output_file)
+        _flush_batch()
         
         return output_files
     
@@ -674,6 +706,99 @@ class PDFMerger:
             return len(reader.pages) * 250
         except Exception:
             return 0
+
+    def _split_oversized_pdf(
+        self,
+        pdf_file: str,
+        output_path: str,
+        group_name: str,
+        start_batch_num: int,
+        max_pages_per_chunk: int,
+        warnings: Optional[List[Dict]] = None,
+        output_label: str = "pdfs",
+        bookmark_titles: Optional[Dict[str, str]] = None,
+        source_file_map: Optional[Dict[str, str]] = None,
+        output_to_sources: Optional[Dict[str, List[str]]] = None,
+    ) -> List[str]:
+        """Split a single oversized PDF into multiple batch files by page ranges."""
+        output_files: List[str] = []
+        try:
+            reader = PdfReader(pdf_file)
+            if reader.is_encrypted:
+                result = reader.decrypt("")
+                if not result:
+                    _record_warning(
+                        warnings,
+                        'pdf_encrypted',
+                        'PDF is password-protected and cannot be split; skipping',
+                        file=pdf_file,
+                    )
+                    return []
+            total_pages = len(reader.pages)
+            if total_pages == 0:
+                _record_warning(
+                    warnings,
+                    'pdf_no_pages',
+                    'PDF contained zero readable pages',
+                    file=pdf_file,
+                )
+                return []
+
+            # Also limit by size: estimate bytes per page from the file
+            file_size = os.path.getsize(pdf_file)
+            bytes_per_page = file_size / total_pages if total_pages else file_size
+            max_pages_by_size = max(1, int(self.max_file_size_bytes / bytes_per_page))
+            chunk_size = max(1, min(max_pages_per_chunk, max_pages_by_size))
+
+            basename = os.path.basename(pdf_file)
+            print(f"    Splitting oversized PDF ({total_pages} pages, "
+                  f"{file_size / (1024*1024):.1f}MB): {basename}")
+
+            batch_num = start_batch_num
+            for start_page in range(0, total_pages, chunk_size):
+                end_page = min(start_page + chunk_size, total_pages)
+                writer = PdfWriter()
+                for page_idx in range(start_page, end_page):
+                    writer.add_page(reader.pages[page_idx])
+
+                # Add bookmark for source file
+                if bookmark_titles and bookmark_titles.get(pdf_file):
+                    part = (start_page // chunk_size) + 1
+                    title = f"{bookmark_titles[pdf_file]} (part {part})"
+                    try:
+                        writer.add_outline_item(title, 0)
+                    except Exception:
+                        pass
+
+                output_filename = f"{group_name}_{output_label}_batch{batch_num}.pdf"
+                output_file = os.path.join(output_path, output_filename)
+
+                with open(output_file, 'wb') as f:
+                    writer.write(f)
+
+                # Track source mapping
+                if output_to_sources is not None:
+                    original = (source_file_map.get(pdf_file, pdf_file)
+                                if source_file_map else pdf_file)
+                    output_to_sources[output_file] = [original]
+
+                out_size_mb = os.path.getsize(output_file) / (1024 * 1024)
+                print(f"      Created: {output_filename} "
+                      f"(pages {start_page+1}-{end_page}, {out_size_mb:.1f}MB)")
+                output_files.append(output_file)
+                batch_num += 1
+
+        except Exception as e:
+            _record_warning(
+                warnings,
+                'pdf_split_failed',
+                'Could not split oversized PDF; skipping',
+                file=pdf_file,
+                error=str(e),
+            )
+            print(f"Warning: Could not split {pdf_file}: {e}")
+
+        return output_files
 
     def _save_pdf_batch(
         self,
@@ -827,8 +952,10 @@ class DOCXMerger:
         if not docx_files:
             return 0
 
-        batches = 1
+        max_batch_words = 50000
+        batches = 0
         current_batch_size = 0
+        current_batch_words = 0
 
         for docx_file in docx_files:
             try:
@@ -836,11 +963,32 @@ class DOCXMerger:
             except OSError:
                 file_size = self.max_file_size_bytes
 
-            if current_batch_size and (current_batch_size + file_size > self.max_file_size_bytes):
+            file_words = self._estimate_docx_word_count(docx_file)
+
+            # Oversized single file — estimate how many chunks it splits into
+            if file_size > self.max_file_size_bytes or file_words > max_batch_words:
+                # Flush current batch if it has content
+                if current_batch_size > 0:
+                    batches += 1
+                    current_batch_size = 0
+                    current_batch_words = 0
+                import math
+                chunks_by_words = math.ceil(file_words / max_batch_words) if file_words else 1
+                chunks_by_size = math.ceil(file_size / self.max_file_size_bytes) if file_size else 1
+                batches += max(chunks_by_words, chunks_by_size)
+                continue
+
+            if current_batch_size and (current_batch_size + file_size > self.max_file_size_bytes or
+                                       current_batch_words + file_words > max_batch_words):
                 batches += 1
                 current_batch_size = 0
+                current_batch_words = 0
 
             current_batch_size += file_size
+            current_batch_words += file_words
+
+        if current_batch_size > 0:
+            batches += 1
 
         return batches
 
@@ -871,11 +1019,25 @@ class DOCXMerger:
         # Sort files by name
         docx_files = sorted(docx_files)
 
-        current_batch = []
+        current_batch: List[str] = []
         current_batch_size = 0
         current_batch_words = 0
         max_batch_words = 50000  # netdoc word limit
         batch_num = 1
+
+        def _flush_batch():
+            nonlocal batch_num, current_batch, current_batch_size, current_batch_words
+            if not current_batch:
+                return
+            output_file = self._save_docx_batch(
+                current_batch, output_path, group_name, batch_num, warnings
+            )
+            if output_file:
+                output_files.append(output_file)
+            batch_num += 1
+            current_batch = []
+            current_batch_size = 0
+            current_batch_words = 0
 
         for docx_file in docx_files:
             try:
@@ -893,42 +1055,34 @@ class DOCXMerger:
             # Estimate word count from paragraph count (fast, no full text extraction)
             file_words = self._estimate_docx_word_count(docx_file)
 
+            # Check if this single file needs splitting
+            needs_split = (file_size > self.max_file_size_bytes or
+                           file_words > max_batch_words)
+
+            if needs_split:
+                # Flush any pending batch before splitting
+                _flush_batch()
+                # Split the oversized DOCX by paragraphs
+                split_files = self._split_oversized_docx(
+                    docx_file, output_path, group_name, batch_num,
+                    max_batch_words, warnings,
+                )
+                output_files.extend(split_files)
+                batch_num += len(split_files)
+                continue
+
             # Check if we need to start a new batch
             if current_batch and (current_batch_size + file_size > self.max_file_size_bytes or
                                   current_batch_words + file_words > max_batch_words):
-                output_file = self._save_docx_batch(
-                    current_batch, output_path, group_name, batch_num, warnings
-                )
-                if output_file:
-                    output_files.append(output_file)
-                batch_num += 1
-                current_batch = []
-                current_batch_size = 0
-                current_batch_words = 0
+                _flush_batch()
 
             current_batch.append(docx_file)
             current_batch_size += file_size
             current_batch_words += file_words
 
-            # Warn if single file exceeds word limit
-            if file_words > max_batch_words:
-                _record_warning(
-                    warnings,
-                    'docx_exceeds_word_cap',
-                    'DOCX exceeds netdoc word limit (50000); writing dedicated batch file',
-                    file=docx_file,
-                    file_words=file_words,
-                    batch_limit_words=max_batch_words,
-                )
-        
         # Save remaining files
-        if current_batch:
-            output_file = self._save_docx_batch(
-                current_batch, output_path, group_name, batch_num, warnings
-            )
-            if output_file:
-                output_files.append(output_file)
-        
+        _flush_batch()
+
         return output_files
     
     def _try_extract_docx_text(self, file_path: str) -> Optional[str]:
@@ -1005,6 +1159,85 @@ class DOCXMerger:
                 return para_count * 15
         except Exception:
             return 0
+
+    def _split_oversized_docx(
+        self,
+        docx_file: str,
+        output_path: str,
+        group_name: str,
+        start_batch_num: int,
+        max_batch_words: int,
+        warnings: Optional[List[Dict]] = None,
+    ) -> List[str]:
+        """Split a single oversized DOCX into multiple batch files by paragraphs."""
+        output_files: List[str] = []
+        try:
+            source_doc = Document(docx_file)
+        except Exception as e:
+            _record_warning(
+                warnings,
+                'docx_split_failed',
+                'Could not open oversized DOCX for splitting; skipping',
+                file=docx_file,
+                error=str(e),
+            )
+            print(f"Warning: Could not split {docx_file}: {e}")
+            return []
+
+        # Collect body elements (skip section properties)
+        elements = [
+            el for el in source_doc.element.body.iterchildren()
+            if not el.tag.endswith('}sectPr')
+        ]
+        if not elements:
+            _record_warning(
+                warnings,
+                'docx_empty_document',
+                'DOCX file had no readable body elements; skipping file',
+                file=docx_file,
+            )
+            return []
+
+        file_size = os.path.getsize(docx_file)
+        basename = os.path.basename(docx_file)
+        total_words = self._estimate_docx_word_count(docx_file)
+        print(f"    Splitting oversized DOCX (~{total_words} words, "
+              f"{file_size / (1024*1024):.1f}MB): {basename}")
+
+        # Also limit by size: estimate bytes per element
+        bytes_per_element = file_size / len(elements) if elements else file_size
+        max_elements_by_size = max(1, int(self.max_file_size_bytes / bytes_per_element))
+
+        # Estimate words per element (~15 words per paragraph)
+        words_per_element = 15
+        max_elements_by_words = max(1, max_batch_words // words_per_element)
+        chunk_size = max(1, min(max_elements_by_words, max_elements_by_size))
+
+        batch_num = start_batch_num
+        for start_idx in range(0, len(elements), chunk_size):
+            end_idx = min(start_idx + chunk_size, len(elements))
+            chunk_elements = elements[start_idx:end_idx]
+
+            merged_doc = Document()
+            part_num = (start_idx // chunk_size) + 1
+            heading = merged_doc.add_heading(level=1)
+            heading.text = f"Document: {basename} (part {part_num})"
+
+            for element in chunk_elements:
+                merged_doc.element.body.append(deepcopy(element))
+
+            output_filename = f"{group_name}_documents_batch{batch_num}.docx"
+            output_file = os.path.join(output_path, output_filename)
+            merged_doc.save(output_file)
+
+            out_size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            est_words = len(chunk_elements) * words_per_element
+            print(f"      Created: {output_filename} "
+                  f"(~{est_words} words, {out_size_mb:.1f}MB)")
+            output_files.append(output_file)
+            batch_num += 1
+
+        return output_files
 
     def _save_docx_batch(
         self,
