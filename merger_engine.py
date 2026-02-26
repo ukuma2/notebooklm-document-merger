@@ -435,7 +435,7 @@ class PDFMerger:
         if not pdf_files:
             return 0
 
-        max_batch_words = 50000
+        max_batch_words = 500000
         max_pages_per_chunk = max_batch_words // 250
         batches = 0
         current_batch_size = 0
@@ -516,8 +516,8 @@ class PDFMerger:
         current_batch = []
         current_batch_size = 0
         current_batch_words = 0
-        max_batch_words = 50000  # netdoc word limit
-        max_pages_per_chunk = max_batch_words // 250  # ~200 pages
+        max_batch_words = 500000  # netdoc word limit
+        max_pages_per_chunk = max_batch_words // 250  # ~2000 pages
         batch_num = 1
 
         def _flush_batch():
@@ -952,7 +952,7 @@ class DOCXMerger:
         if not docx_files:
             return 0
 
-        max_batch_words = 50000
+        max_batch_words = 500000
         batches = 0
         current_batch_size = 0
         current_batch_words = 0
@@ -1022,7 +1022,7 @@ class DOCXMerger:
         current_batch: List[str] = []
         current_batch_size = 0
         current_batch_words = 0
-        max_batch_words = 50000  # netdoc word limit
+        max_batch_words = 500000  # netdoc word limit
         batch_num = 1
 
         def _flush_batch():
@@ -3024,7 +3024,7 @@ class MergeOrchestrator:
     ) -> Tuple[List[str], Dict[str, Any]]:
         os.makedirs(output_path, exist_ok=True)
         max_batch_bytes = self.email_max_output_file_mb * 1024 * 1024
-        max_batch_words = 50000  # netdoc word limit
+        max_batch_words = 500000  # netdoc word limit
         thread_blocks = []
         for thread_num, (thread_key, emails) in enumerate(sorted(threads.items()), 1):
             block_text = self._render_thread_block(thread_num, thread_key, emails)
@@ -3070,7 +3070,7 @@ class MergeOrchestrator:
                 _record_warning(
                     warnings,
                     "email_thread_exceeds_word_cap",
-                    "Email thread exceeds netdoc word limit (50000); writing dedicated batch file",
+                    "Email thread exceeds netdoc word limit (500000); writing dedicated batch file",
                     thread_key=block["thread_key"],
                     group=group_name,
                     thread_words=block_words,
