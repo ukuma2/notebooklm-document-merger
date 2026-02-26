@@ -410,7 +410,7 @@ class XlsxToCsvConverter:
                 safe_sheet = re.sub(r'[^\w\-]', '_', sheet_name)
                 csv_path = os.path.join(output_dir, f"{base_name}_{safe_sheet}.csv")
 
-                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
                     writer = csv.writer(f)
                     for row in ws.iter_rows(values_only=True):
                         writer.writerow(row)
@@ -2332,13 +2332,6 @@ class MergeOrchestrator:
             if source_lower.endswith('.mov') and MovToMp4Converter.is_available():
                 dest_mp4 = os.path.join(os.path.dirname(destination), base_name_no_ext + '.mp4')
                 if MovToMp4Converter.convert(source_path, dest_mp4):
-                    _record_warning(
-                        warnings,
-                        'unsupported_mov_converted',
-                        'MOV converted to MP4 and placed in unprocessed',
-                        file=source_path,
-                        destination=dest_mp4,
-                    )
                     if run_logger:
                         run_logger.log(
                             "info",
@@ -2352,13 +2345,6 @@ class MergeOrchestrator:
             elif source_lower.endswith('.xlsx') and XlsxToCsvConverter.is_available():
                 csvs = XlsxToCsvConverter.convert(source_path, os.path.dirname(destination), base_name_no_ext)
                 if csvs:
-                    _record_warning(
-                        warnings,
-                        'unsupported_xlsx_converted',
-                        'XLSX converted to CSV(s) and placed in unprocessed',
-                        file=source_path,
-                        csv_count=len(csvs),
-                    )
                     if run_logger:
                         run_logger.log(
                             "info",
