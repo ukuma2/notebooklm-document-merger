@@ -587,7 +587,10 @@ class PDFMerger:
         try:
             reader = PdfReader(pdf_file)
             if reader.is_encrypted:
-                return ""
+                # Try to decrypt with empty password (handles "view-only" PDFs)
+                result = reader.decrypt("")
+                if not result:
+                    return ""  # genuinely password-protected, can't read
             text = ""
             for page in reader.pages:
                 try:
@@ -635,13 +638,18 @@ class PDFMerger:
             try:
                 reader = PdfReader(pdf_file)
                 if reader.is_encrypted:
-                    _record_warning(
-                        warnings,
-                        'pdf_encrypted',
-                        'PDF is password-protected and cannot be merged; skipping',
-                        file=pdf_file,
-                    )
-                    continue
+                    # Try to decrypt with empty password (handles "view-only" PDFs)
+                    result = reader.decrypt("")
+                    if not result:
+                        # genuinely password-protected, can't decrypt
+                        _record_warning(
+                            warnings,
+                            'pdf_encrypted',
+                            'PDF is password-protected and cannot be merged; skipping',
+                            file=pdf_file,
+                        )
+                        continue
+                    # else: successfully decrypted, continue with normal processing
                 page_start = total_pages_added
                 file_pages_added = 0
                 for page in reader.pages:
