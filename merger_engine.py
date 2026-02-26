@@ -340,6 +340,88 @@ class WordToPdfConverter:
                     pass
 
 
+class MovToMp4Converter:
+    """Converts .mov files to .mp4 using the bundled imageio-ffmpeg binary."""
+
+    @staticmethod
+    def is_available() -> bool:
+        """Check if ffmpeg is available via imageio-ffmpeg."""
+        try:
+            import imageio_ffmpeg
+            imageio_ffmpeg.get_ffmpeg_exe()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def convert(source_path: str, dest_path: str) -> bool:
+        """
+        Convert MOV to MP4.
+
+        Returns:
+            True on success, False on failure
+        """
+        try:
+            import imageio_ffmpeg
+            import subprocess
+
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            result = subprocess.run(
+                [ffmpeg_exe, '-y', '-i', source_path,
+                 '-c:v', 'copy', '-c:a', 'aac', dest_path],
+                capture_output=True,
+                timeout=300
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+
+class XlsxToCsvConverter:
+    """Converts .xlsx sheets to individual .csv files using openpyxl."""
+
+    @staticmethod
+    def is_available() -> bool:
+        """Check if openpyxl is available."""
+        try:
+            import openpyxl
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def convert(source_path: str, output_dir: str, base_name: str) -> List[str]:
+        """
+        Convert XLSX to CSV files (one per sheet).
+
+        Returns:
+            List of created CSV file paths. Empty list on failure.
+        """
+        import csv
+        try:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(source_path, data_only=True)
+            outputs = []
+
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                # Sanitize sheet name for filename
+                safe_sheet = re.sub(r'[^\w\-]', '_', sheet_name)
+                csv_path = os.path.join(output_dir, f"{base_name}_{safe_sheet}.csv")
+
+                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    for row in ws.iter_rows(values_only=True):
+                        writer.writerow(row)
+
+                outputs.append(csv_path)
+
+            return outputs
+        except Exception:
+            return []
+
+
 class PDFMerger:
     """Merges multiple PDF files into batched output files"""
     
@@ -2241,6 +2323,65 @@ class MergeOrchestrator:
                 destination = os.path.join(target_root, target_prefix, relative)
             os.makedirs(os.path.dirname(destination), exist_ok=True)
             destination = self._ensure_unique_destination(destination)
+
+            # Try conversions for .mov and .xlsx before falling back to copy/move
+            converted = False
+            source_lower = source_path.lower()
+            base_name_no_ext = os.path.splitext(os.path.basename(source_path))[0]
+
+            if source_lower.endswith('.mov') and MovToMp4Converter.is_available():
+                dest_mp4 = os.path.join(os.path.dirname(destination), base_name_no_ext + '.mp4')
+                if MovToMp4Converter.convert(source_path, dest_mp4):
+                    _record_warning(
+                        warnings,
+                        'unsupported_mov_converted',
+                        'MOV converted to MP4 and placed in unprocessed',
+                        file=source_path,
+                        destination=dest_mp4,
+                    )
+                    if run_logger:
+                        run_logger.log(
+                            "info",
+                            "unsupported_mov_converted",
+                            "MOV file converted to MP4",
+                            source=source_path,
+                            destination=dest_mp4,
+                        )
+                    converted = True
+
+            elif source_lower.endswith('.xlsx') and XlsxToCsvConverter.is_available():
+                csvs = XlsxToCsvConverter.convert(source_path, os.path.dirname(destination), base_name_no_ext)
+                if csvs:
+                    _record_warning(
+                        warnings,
+                        'unsupported_xlsx_converted',
+                        'XLSX converted to CSV(s) and placed in unprocessed',
+                        file=source_path,
+                        csv_count=len(csvs),
+                    )
+                    if run_logger:
+                        run_logger.log(
+                            "info",
+                            "unsupported_xlsx_converted",
+                            "XLSX file converted to CSV(s)",
+                            source=source_path,
+                            csv_count=len(csvs),
+                        )
+                    converted = True
+
+            # If no conversion happened, proceed with normal copy/move
+            if converted:
+                # Already handled by conversion
+                entry = {
+                    "source": source_path,
+                    "destination": os.path.dirname(destination),
+                    "action": "converted",
+                    "reason": reason,
+                    "origin": origin,
+                    "stage": stage,
+                }
+                relocated_entries.append(entry)
+                continue
 
             try:
                 self._copy_or_move_file(source_path, destination, normalized_action)

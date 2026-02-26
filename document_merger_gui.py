@@ -356,7 +356,8 @@ class DocumentMergerGUI:
             "failed_artifact_created",
         }
 
-        if event in {"unsupported_input_file_relocated", "unsupported_zip_file_relocated"}:
+        if event in {"unsupported_input_file_relocated", "unsupported_zip_file_relocated",
+                     "unsupported_mov_converted", "unsupported_xlsx_converted"}:
             self.unprocessed_count_var.set(self.unprocessed_count_var.get() + 1)
         elif event in _ZIP_SKIP_EVENTS:
             self.skipped_count_var.set(self.skipped_count_var.get() + 1)

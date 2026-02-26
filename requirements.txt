@@ -5,6 +5,8 @@ python-dateutil>=2.8.2
 Pillow>=10.0.0
 olefile>=0.46
 pywin32>=306; platform_system=="Windows"
+imageio-ffmpeg>=0.5.1
+openpyxl>=3.0.10
 
 # ── Build / packaging only (not needed at runtime) ──
 # pyinstaller>=6.0
