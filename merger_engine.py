@@ -398,14 +398,16 @@ class PDFMerger:
         
         os.makedirs(output_path, exist_ok=True)
         output_files = []
-        
+
         # Sort PDFs by name for consistent ordering
         pdf_files = sorted(pdf_files)
-        
+
         current_batch = []
         current_batch_size = 0
+        current_batch_words = 0
+        max_batch_words = 50000  # netdoc word limit
         batch_num = 1
-        
+
         for pdf_file in pdf_files:
             try:
                 file_size = os.path.getsize(pdf_file)
@@ -418,9 +420,14 @@ class PDFMerger:
                     error=str(exc),
                 )
                 file_size = self.max_file_size_bytes
-            
+
+            # Extract text to count words
+            file_text = self._extract_pdf_text(pdf_file)
+            file_words = self._count_words_in_text(file_text)
+
             # If adding this file would exceed limit, save current batch
-            if current_batch and (current_batch_size + file_size > self.max_file_size_bytes):
+            if current_batch and (current_batch_size + file_size > self.max_file_size_bytes or
+                                  current_batch_words + file_words > max_batch_words):
                 output_file = self._save_pdf_batch(
                     current_batch,
                     output_path,
@@ -437,9 +444,22 @@ class PDFMerger:
                 batch_num += 1
                 current_batch = []
                 current_batch_size = 0
-            
+                current_batch_words = 0
+
             current_batch.append(pdf_file)
             current_batch_size += file_size
+            current_batch_words += file_words
+
+            # Warn if single file exceeds word limit
+            if file_words > max_batch_words:
+                _record_warning(
+                    warnings,
+                    'pdf_exceeds_word_cap',
+                    'PDF exceeds netdoc word limit (50000); writing dedicated batch file',
+                    file=pdf_file,
+                    file_words=file_words,
+                    batch_limit_words=max_batch_words,
+                )
         
         # Save remaining files
         if current_batch:
@@ -562,6 +582,25 @@ class PDFMerger:
         except Exception:
             return None
 
+    def _extract_pdf_text(self, pdf_file: str) -> str:
+        """Extract text from a PDF file for word counting."""
+        try:
+            reader = PdfReader(pdf_file)
+            if reader.is_encrypted:
+                return ""
+            text = ""
+            for page in reader.pages:
+                try:
+                    text += page.extract_text() or ""
+                except Exception:
+                    pass
+            return text
+        except Exception:
+            return ""
+
+    def _count_words_in_text(self, text: str) -> int:
+        """Count words in text by splitting on whitespace."""
+        return len(text.split())
 
     def _save_pdf_batch(
         self,
@@ -750,14 +789,16 @@ class DOCXMerger:
         
         os.makedirs(output_path, exist_ok=True)
         output_files = []
-        
+
         # Sort files by name
         docx_files = sorted(docx_files)
-        
+
         current_batch = []
         current_batch_size = 0
+        current_batch_words = 0
+        max_batch_words = 50000  # netdoc word limit
         batch_num = 1
-        
+
         for docx_file in docx_files:
             try:
                 file_size = os.path.getsize(docx_file)
@@ -770,9 +811,14 @@ class DOCXMerger:
                     error=str(exc),
                 )
                 file_size = self.max_file_size_bytes
-            
+
+            # Extract text to count words
+            file_text = self._extract_docx_text_for_counting(docx_file)
+            file_words = self._count_words_in_text(file_text)
+
             # Check if we need to start a new batch
-            if current_batch and (current_batch_size + file_size > self.max_file_size_bytes):
+            if current_batch and (current_batch_size + file_size > self.max_file_size_bytes or
+                                  current_batch_words + file_words > max_batch_words):
                 output_file = self._save_docx_batch(
                     current_batch, output_path, group_name, batch_num, warnings
                 )
@@ -781,9 +827,22 @@ class DOCXMerger:
                 batch_num += 1
                 current_batch = []
                 current_batch_size = 0
-            
+                current_batch_words = 0
+
             current_batch.append(docx_file)
             current_batch_size += file_size
+            current_batch_words += file_words
+
+            # Warn if single file exceeds word limit
+            if file_words > max_batch_words:
+                _record_warning(
+                    warnings,
+                    'docx_exceeds_word_cap',
+                    'DOCX exceeds netdoc word limit (50000); writing dedicated batch file',
+                    file=docx_file,
+                    file_words=file_words,
+                    batch_limit_words=max_batch_words,
+                )
         
         # Save remaining files
         if current_batch:
@@ -853,6 +912,33 @@ class DOCXMerger:
             return text.strip() if text.strip() else None
         except Exception:
             return None
+
+    def _extract_docx_text_for_counting(self, file_path: str) -> str:
+        """Extract text from DOCX file for word counting."""
+        # Try using python-docx library
+        try:
+            from docx import Document as DocxDocument
+            doc = DocxDocument(file_path)
+            text = ""
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + " "
+            return text
+        except Exception:
+            pass
+
+        # Fallback to raw text extraction
+        raw_text = self._try_extract_docx_text(file_path)
+        if raw_text:
+            return raw_text
+        # Try OLE fallback
+        ole_text = self._try_extract_ole_text(file_path)
+        if ole_text:
+            return ole_text
+        return ""
+
+    def _count_words_in_text(self, text: str) -> int:
+        """Count words in text by splitting on whitespace."""
+        return len(text.split())
 
     def _save_docx_batch(
         self,
