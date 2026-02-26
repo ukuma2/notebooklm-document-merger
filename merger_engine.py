@@ -744,27 +744,44 @@ class PDFMerger:
                 )
                 return []
 
-            # Also limit by size: estimate bytes per page from the file
+            # Estimate bytes per page — use a safety factor because page sizes
+            # vary wildly (scanned images vs text).  Writing to a BytesIO buffer
+            # first lets us verify the size and re-split if needed.
             file_size = os.path.getsize(pdf_file)
             bytes_per_page = file_size / total_pages if total_pages else file_size
-            max_pages_by_size = max(1, int(self.max_file_size_bytes / bytes_per_page))
-            chunk_size = max(1, min(max_pages_per_chunk, max_pages_by_size))
+            # 75% safety margin to handle uneven page sizes
+            max_pages_by_size = max(1, int(self.max_file_size_bytes * 0.75 / bytes_per_page))
+            target_chunk = max(1, min(max_pages_per_chunk, max_pages_by_size))
 
             basename = os.path.basename(pdf_file)
             print(f"    Splitting oversized PDF ({total_pages} pages, "
                   f"{file_size / (1024*1024):.1f}MB): {basename}")
 
             batch_num = start_batch_num
-            for start_page in range(0, total_pages, chunk_size):
-                end_page = min(start_page + chunk_size, total_pages)
-                writer = PdfWriter()
-                for page_idx in range(start_page, end_page):
-                    writer.add_page(reader.pages[page_idx])
+            page_cursor = 0
+            part_num = 0
+            while page_cursor < total_pages:
+                # Try writing target_chunk pages; shrink if result exceeds limit
+                chunk_size = min(target_chunk, total_pages - page_cursor)
+                while chunk_size > 0:
+                    writer = PdfWriter()
+                    for page_idx in range(page_cursor, page_cursor + chunk_size):
+                        writer.add_page(reader.pages[page_idx])
 
+                    buf = io.BytesIO()
+                    writer.write(buf)
+                    chunk_bytes = buf.tell()
+
+                    if chunk_bytes <= self.max_file_size_bytes or chunk_size == 1:
+                        # Acceptable size, or single page (can't split further)
+                        break
+                    # Too large — halve the chunk and retry
+                    chunk_size = max(1, chunk_size // 2)
+
+                part_num += 1
                 # Add bookmark for source file
                 if bookmark_titles and bookmark_titles.get(pdf_file):
-                    part = (start_page // chunk_size) + 1
-                    title = f"{bookmark_titles[pdf_file]} (part {part})"
+                    title = f"{bookmark_titles[pdf_file]} (part {part_num})"
                     try:
                         writer.add_outline_item(title, 0)
                     except Exception:
@@ -774,7 +791,7 @@ class PDFMerger:
                 output_file = os.path.join(output_path, output_filename)
 
                 with open(output_file, 'wb') as f:
-                    writer.write(f)
+                    f.write(buf.getvalue())
 
                 # Track source mapping
                 if output_to_sources is not None:
@@ -782,11 +799,13 @@ class PDFMerger:
                                 if source_file_map else pdf_file)
                     output_to_sources[output_file] = [original]
 
-                out_size_mb = os.path.getsize(output_file) / (1024 * 1024)
+                out_size_mb = chunk_bytes / (1024 * 1024)
+                end_page = page_cursor + chunk_size
                 print(f"      Created: {output_filename} "
-                      f"(pages {start_page+1}-{end_page}, {out_size_mb:.1f}MB)")
+                      f"(pages {page_cursor+1}-{end_page}, {out_size_mb:.1f}MB)")
                 output_files.append(output_file)
                 batch_num += 1
+                page_cursor += chunk_size
 
         except Exception as e:
             _record_warning(
