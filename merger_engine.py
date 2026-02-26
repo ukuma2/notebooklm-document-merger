@@ -503,9 +503,8 @@ class PDFMerger:
                 )
                 file_size = self.max_file_size_bytes
 
-            # Extract text to count words
-            file_text = self._extract_pdf_text(pdf_file)
-            file_words = self._count_words_in_text(file_text)
+            # Estimate word count from page count (fast, no text extraction)
+            file_words = self._estimate_pdf_word_count(pdf_file)
 
             # If adding this file would exceed limit, save current batch
             if current_batch and (current_batch_size + file_size > self.max_file_size_bytes or
@@ -664,28 +663,17 @@ class PDFMerger:
         except Exception:
             return None
 
-    def _extract_pdf_text(self, pdf_file: str) -> str:
-        """Extract text from a PDF file for word counting."""
+    def _estimate_pdf_word_count(self, pdf_file: str) -> int:
+        """Estimate word count from page count (~250 words/page). Instant, no text extraction."""
         try:
             reader = PdfReader(pdf_file)
             if reader.is_encrypted:
-                # Try to decrypt with empty password (handles "view-only" PDFs)
                 result = reader.decrypt("")
                 if not result:
-                    return ""  # genuinely password-protected, can't read
-            text = ""
-            for page in reader.pages:
-                try:
-                    text += page.extract_text() or ""
-                except Exception:
-                    pass
-            return text
+                    return 0
+            return len(reader.pages) * 250
         except Exception:
-            return ""
-
-    def _count_words_in_text(self, text: str) -> int:
-        """Count words in text by splitting on whitespace."""
-        return len(text.split())
+            return 0
 
     def _save_pdf_batch(
         self,
@@ -902,9 +890,8 @@ class DOCXMerger:
                 )
                 file_size = self.max_file_size_bytes
 
-            # Extract text to count words
-            file_text = self._extract_docx_text_for_counting(docx_file)
-            file_words = self._count_words_in_text(file_text)
+            # Estimate word count from paragraph count (fast, no full text extraction)
+            file_words = self._estimate_docx_word_count(docx_file)
 
             # Check if we need to start a new batch
             if current_batch and (current_batch_size + file_size > self.max_file_size_bytes or
@@ -1003,32 +990,21 @@ class DOCXMerger:
         except Exception:
             return None
 
-    def _extract_docx_text_for_counting(self, file_path: str) -> str:
-        """Extract text from DOCX file for word counting."""
-        # Try using python-docx library
+    def _estimate_docx_word_count(self, file_path: str) -> int:
+        """Estimate word count from paragraph count (~15 words/paragraph). Fast XML scan."""
         try:
-            from docx import Document as DocxDocument
-            doc = DocxDocument(file_path)
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + " "
-            return text
+            import zipfile
+            import xml.etree.ElementTree as ET
+            with zipfile.ZipFile(file_path, 'r') as z:
+                candidates = [n for n in z.namelist() if n.endswith('document.xml')]
+                if not candidates:
+                    return 0
+                root = ET.fromstring(z.read(candidates[0]))
+                ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+                para_count = sum(1 for _ in root.iter(f'{ns}p'))
+                return para_count * 15
         except Exception:
-            pass
-
-        # Fallback to raw text extraction
-        raw_text = self._try_extract_docx_text(file_path)
-        if raw_text:
-            return raw_text
-        # Try OLE fallback
-        ole_text = self._try_extract_ole_text(file_path)
-        if ole_text:
-            return ole_text
-        return ""
-
-    def _count_words_in_text(self, text: str) -> int:
-        """Count words in text by splitting on whitespace."""
-        return len(text.split())
+            return 0
 
     def _save_docx_batch(
         self,
