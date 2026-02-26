@@ -75,6 +75,9 @@ def main():
         "--hidden-import=pywintypes",
         # extract_msg uses pkg_resources / importlib.metadata internally
         "--collect-all=extract_msg",
+        # imageio-ffmpeg bundles a real ffmpeg binary as a data file — must collect-all
+        "--collect-all=imageio_ffmpeg",
+        "--hidden-import=openpyxl",
         str(ENTRY),
     ]
 
